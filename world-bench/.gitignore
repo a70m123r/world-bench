@@ -1,0 +1,7 @@
+node_modules/
+dist/
+orchestrator/config/.env
+projects/
+orchestrator/memory/
+orchestrator/runs/
+*.log
