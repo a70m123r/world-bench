@@ -61,6 +61,14 @@ export interface AgentResult {
   events: WorkflowEvent[];
 }
 
+/** Claude-specific extension for file checkpoint rollback */
+export interface ClaudeAgentResult extends AgentResult {
+  rewindContext?: {
+    query: any;
+    lastUserMessageId: string;
+  };
+}
+
 export interface AgentAdapter {
   spawn(
     prompt: string,
@@ -77,7 +85,6 @@ export interface ProjectMeta {
   name: string;
   slug: string;
   created_at: string;
-  orchestrator_channel_id?: string;
   project_channel_id?: string;
   lenses: string[];        // lens slugs
 }

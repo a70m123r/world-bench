@@ -7,8 +7,10 @@ import { WebClient } from '@slack/web-api';
 import * as fs from 'fs';
 import * as path from 'path';
 import { LensConfig, OrchestratorCommand, ProjectMeta } from '../agents/types';
+import { createEvent, appendEvent } from './event-log';
 
 const WORLD_BENCH_ROOT = process.env.WORLD_BENCH_ROOT || path.resolve(__dirname, '..');
+const PAV_USER_ID = process.env.PAV_USER_ID || 'U0AL61DRV6D';
 
 export class Terminal {
   private app: App;
@@ -30,36 +32,88 @@ export class Terminal {
   }
 
   async start(): Promise<void> {
-    // Register message handler before starting
+    // Register app_mention handler — fires when ANY user or bot tags @Orchestrator
+    this.app.event('app_mention', async ({ event }) => {
+      const channelId = event.channel;
+      const text = event.text || '';
+      const userId = event.user || '';
+      const ts = event.ts;
+
+      // Strip the @mention
+      const cleanText = this.botUserId
+        ? text.replace(new RegExp(`<@${this.botUserId}(?:\\|[^>]*)?>`, 'g'), '').trim()
+        : text.trim();
+
+      if (!cleanText) return;
+
+      console.log(`[Terminal] @mention from ${userId} in ${channelId}: ${cleanText}`);
+
+      const cmd: OrchestratorCommand = {
+        raw: cleanText,
+        intent: cleanText,
+        channel_id: channelId,
+        thread_ts: (event as any).thread_ts,
+        user_id: userId,
+        ts,
+      };
+
+      try {
+        await this.orchestrator.handleCommand(cmd);
+      } catch (error: any) {
+        console.error('[Terminal] Error handling @mention:', error);
+        await this.postToChannel(channelId, `Something went wrong: ${error.message}`);
+      }
+    });
+
+    // Register message handler — fires on regular messages (home channel + feedback)
     this.app.message(async ({ message }) => {
-      // Only process messages in #orchestrator
-      if ((message as any).channel !== this.orchestratorChannelId) return;
+      const channelId = (message as any).channel;
 
       // Ignore bot messages (including our own)
       if ((message as any).bot_id || (message as any).subtype) return;
 
       const text = (message as any).text || '';
       const userId = (message as any).user || '';
-
-      // Skip if empty
       if (!text.trim()) return;
 
-      console.log(`[Terminal] Received from ${userId}: ${text}`);
+      // Home channel only — all messages handled.
+      // @mentions in other channels are handled by app_mention event (no double-dispatch).
+      const isHomeChannel = channelId === this.orchestratorChannelId;
 
-      const cmd: OrchestratorCommand = {
-        raw: text,
-        intent: text, // raw text — Orchestrator interprets
-        channel_id: (message as any).channel,
-        thread_ts: (message as any).thread_ts,
-        user_id: userId,
-        ts: (message as any).ts,
-      };
+      if (isHomeChannel) {
+        // Skip messages that are just @mentions — app_mention handler has those
+        const isJustMention = this.botUserId && text.includes(`<@${this.botUserId}>`);
+        const cleanText = isJustMention
+          ? text.replace(new RegExp(`<@${this.botUserId}(?:\\|[^>]*)?>`, 'g'), '').trim()
+          : text;
 
-      try {
-        await this.orchestrator.handleCommand(cmd);
-      } catch (error: any) {
-        console.error('[Terminal] Error handling command:', error);
-        await this.postToOrchestrator(`Error: ${error.message}`);
+        if (!cleanText) return;
+
+        console.log(`[Terminal] Command from ${userId} in ${channelId}: ${cleanText}`);
+
+        const cmd: OrchestratorCommand = {
+          raw: cleanText,
+          intent: cleanText,
+          channel_id: channelId,
+          thread_ts: (message as any).thread_ts,
+          user_id: userId,
+          ts: (message as any).ts,
+        };
+
+        try {
+          await this.orchestrator.handleCommand(cmd);
+        } catch (error: any) {
+          console.error('[Terminal] Error handling command:', error);
+          await this.postToChannel(channelId, `Something went wrong: ${error.message}`);
+        }
+        return;
+      }
+
+      // Route 3: Messages in #wb-proj-* channels → feedback capture
+      const projectSlug = this.getProjectSlugForChannel(channelId);
+      if (projectSlug) {
+        console.log(`[Terminal] Feedback in proj-${projectSlug} from ${userId}: ${text.slice(0, 80)}`);
+        this.captureFeedback(projectSlug, userId, text);
       }
     });
 
@@ -75,6 +129,11 @@ export class Terminal {
     // Find or create #wb-orchestrator channel
     this.orchestratorChannelId = await this.findOrCreateChannel('wb-orchestrator', 'World-Bench Orchestrator command surface');
     console.log(`[Terminal] Orchestrator channel: ${this.orchestratorChannelId}`);
+
+    // Initialize context provider with Slack client
+    if (this.orchestratorChannelId) {
+      this.orchestrator.initContextProvider(this.client, this.orchestratorChannelId);
+    }
 
     // Announce presence
     if (this.orchestratorChannelId) {
@@ -127,6 +186,15 @@ export class Terminal {
         } catch { /* non-critical */ }
       }
 
+      // Auto-invite Pav to every channel the Orchestrator creates
+      try {
+        await this.client.conversations.invite({ channel: channelId, users: PAV_USER_ID });
+      } catch (e: any) {
+        if (e.data?.error !== 'already_in_channel') {
+          console.warn(`[Terminal] Could not invite Pav to #${name}: ${e.data?.error || e.message}`);
+        }
+      }
+
       console.log(`[Terminal] Created channel #${name} (${channelId})`);
       return channelId;
     } catch (error: any) {
@@ -143,6 +211,38 @@ export class Terminal {
   }
 
   // ─── Posting ───
+
+  async addThinkingReaction(channelId: string, ts: string): Promise<void> {
+    try {
+      await this.client.reactions.add({
+        channel: channelId,
+        timestamp: ts,
+        name: 'hourglass_flowing_sand',
+      });
+    } catch { }
+  }
+
+  async removeThinkingReaction(channelId: string, ts: string): Promise<void> {
+    try {
+      await this.client.reactions.remove({
+        channel: channelId,
+        timestamp: ts,
+        name: 'hourglass_flowing_sand',
+      });
+    } catch { }
+  }
+
+  async postToChannel(channelId: string, text: string): Promise<void> {
+    try {
+      await this.client.chat.postMessage({
+        channel: channelId,
+        text,
+        unfurl_links: false,
+      });
+    } catch (error: any) {
+      console.error(`[Terminal] Failed to post to ${channelId}:`, error.message);
+    }
+  }
 
   async postToOrchestrator(text: string): Promise<void> {
     if (!this.orchestratorChannelId) return;
@@ -179,34 +279,43 @@ export class Terminal {
    * Post as a lens persona using chat:write.customize.
    * Posts to the lens's own channel AND to the project channel.
    */
+  /**
+   * Post as a lens persona to the PROJECT channel only.
+   * Used for human-readable summaries.
+   */
   async postAsLens(lens: LensConfig, projectSlug: string, text: string): Promise<void> {
-    const postOpts = {
-      text,
-      username: lens.slackPersona.username,
-      icon_emoji: lens.slackPersona.icon_emoji,
-      unfurl_links: false,
-    };
-
-    // Post to project channel
     const projectChannelId = this.getProjectChannelId(projectSlug);
     if (projectChannelId) {
       try {
         await this.client.chat.postMessage({
           channel: projectChannelId,
-          ...postOpts,
+          text,
+          username: lens.slackPersona.username,
+          icon_emoji: lens.slackPersona.icon_emoji,
+          unfurl_links: false,
         });
       } catch (error: any) {
         console.error(`[Terminal] Failed to post as lens to project:`, error.message);
       }
     }
+  }
 
-    // Post to lens-specific channel
-    const lensChannelId = this.getLensChannelId(projectSlug, lens.id);
+  /**
+   * Post as a lens persona to the LENS channel only.
+   * Used for full output / detailed logs.
+   */
+  async postToLensChannel(
+    projectSlug: string, lensId: string, lens: LensConfig, text: string,
+  ): Promise<void> {
+    const lensChannelId = this.getLensChannelId(projectSlug, lensId);
     if (lensChannelId) {
       try {
         await this.client.chat.postMessage({
           channel: lensChannelId,
-          ...postOpts,
+          text,
+          username: lens.slackPersona.username,
+          icon_emoji: lens.slackPersona.icon_emoji,
+          unfurl_links: false,
         });
       } catch (error: any) {
         console.error(`[Terminal] Failed to post to lens channel:`, error.message);
@@ -237,6 +346,54 @@ export class Terminal {
       return data.slack_channel_id || null;
     } catch {
       return null;
+    }
+  }
+
+  // ─── Feedback Capture ───
+
+  /**
+   * Reverse-lookup: given a Slack channel ID, find which project it belongs to.
+   */
+  private getProjectSlugForChannel(channelId: string): string | null {
+    try {
+      const projectsDir = path.join(WORLD_BENCH_ROOT, 'projects');
+      if (!fs.existsSync(projectsDir)) return null;
+
+      for (const slug of fs.readdirSync(projectsDir)) {
+        const projectJsonPath = path.join(projectsDir, slug, 'project.json');
+        if (!fs.existsSync(projectJsonPath)) continue;
+        const meta: ProjectMeta = JSON.parse(fs.readFileSync(projectJsonPath, 'utf-8'));
+        if (meta.project_channel_id === channelId) return slug;
+      }
+    } catch { }
+    return null;
+  }
+
+  /**
+   * Capture Pav's message in a project channel as a feedback WorkflowEvent.
+   * Logged to the most recent run's events.jsonl.
+   */
+  private captureFeedback(projectSlug: string, userId: string, text: string): void {
+    try {
+      // Find the most recent run
+      const runsDir = path.join(WORLD_BENCH_ROOT, 'projects', projectSlug, 'runs');
+      if (!fs.existsSync(runsDir)) return;
+
+      const runs = fs.readdirSync(runsDir).sort();
+      if (runs.length === 0) return;
+
+      const latestRunId = runs[runs.length - 1];
+      const actor = userId === PAV_USER_ID ? 'pav' : `user:${userId}`;
+
+      const event = createEvent(
+        latestRunId, actor, 'message', text,
+        { source: 'slack_feedback', channel_type: 'project' },
+      );
+
+      appendEvent(projectSlug, latestRunId, event);
+      console.log(`[Terminal] Feedback captured for run ${latestRunId.slice(0, 8)}`);
+    } catch (e: any) {
+      console.warn(`[Terminal] Failed to capture feedback: ${e.message}`);
     }
   }
 }

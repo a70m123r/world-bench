@@ -1,22 +1,24 @@
 // World-Bench v0.4 — Lens Manager
 // Spawns lens agents via AgentAdapter, monitors lifecycle,
-// handles research phase time enforcement, writes events.
+// handles research phase (with timeout), writes events.
+// Uses SDK file checkpointing for workspace rollback on failure.
 
 import * as fs from 'fs';
 import * as path from 'path';
 import { v4 as uuid } from 'uuid';
 import {
   LensConfig,
-  AgentAdapter,
   AgentResult,
   WorkflowEvent,
   RunMeta,
 } from '../agents/types';
+import { ClaudeAgentAdapter } from './agent-adapter';
 import {
   buildLensSystemPrompt,
   buildResearchPrompt,
   buildProductionPrompt,
 } from '../agents/base-lens-agent';
+import { createEvent, appendEvent, setWorldBenchRoot } from './event-log';
 
 const DEFAULT_RESEARCH_DURATION = 120; // seconds
 
@@ -28,12 +30,13 @@ export interface LensRunResult {
 }
 
 export class LensManager {
-  private adapter: AgentAdapter;
+  private adapter: ClaudeAgentAdapter;
   private worldBenchRoot: string;
 
-  constructor(adapter: AgentAdapter, worldBenchRoot: string) {
+  constructor(adapter: ClaudeAgentAdapter, worldBenchRoot: string) {
     this.adapter = adapter;
     this.worldBenchRoot = worldBenchRoot;
+    setWorldBenchRoot(worldBenchRoot);
   }
 
   /**
@@ -53,36 +56,39 @@ export class LensManager {
     let researchOutput: string | undefined;
 
     // Emit start event
-    const startEvent = this.createEvent(runId, 'orchestrator', 'state_change',
+    const startEvent = createEvent(runId, 'orchestrator', 'state_change',
       `Starting lens: ${lens.name}`, { lens_id: lens.id, phase: 'start' });
     allEvents.push(startEvent);
-    this.appendEvent(projectSlug, runId, startEvent);
+    appendEvent(projectSlug, runId, startEvent);
 
     const lensWorkspace = path.join(
       this.worldBenchRoot, 'projects', projectSlug, 'lenses', lens.id, 'workspace',
     );
     fs.mkdirSync(lensWorkspace, { recursive: true });
 
+    const baseContext = {
+      systemPrompt: buildLensSystemPrompt(lens),
+      run_id: runId,
+      lens_name: lens.name,
+      purpose: lens.purpose,
+      cwd: lensWorkspace,
+      projectSlug,
+    };
+
     // ─── Research Phase ───
     if (lens.researchPhase.enabled) {
-      const researchEvent = this.createEvent(runId, lens.name, 'state_change',
+      const researchEvent = createEvent(runId, lens.name, 'state_change',
         `Entering research phase`, { phase: 'researching' });
       allEvents.push(researchEvent);
-      this.appendEvent(projectSlug, runId, researchEvent);
+      appendEvent(projectSlug, runId, researchEvent);
 
       const researchPrompt = buildResearchPrompt(lens);
-      const systemPrompt = buildLensSystemPrompt(lens);
       const maxDuration = (lens.researchPhase.maxDuration || DEFAULT_RESEARCH_DURATION) * 1000;
 
       researchResult = await this.spawnWithTimeout(
         researchPrompt,
         lens.tools,
-        {
-          systemPrompt,
-          run_id: runId,
-          lens_name: lens.name,
-          cwd: lensWorkspace,
-        },
+        baseContext,
         maxDuration,
       );
 
@@ -99,42 +105,60 @@ export class LensManager {
 
       allEvents.push(...researchResult.events);
       for (const e of researchResult.events) {
-        this.appendEvent(projectSlug, runId, e);
+        appendEvent(projectSlug, runId, e);
       }
 
-      const researchDoneEvent = this.createEvent(runId, lens.name, 'state_change',
+      // If research failed, attempt workspace rollback via file checkpoint
+      if (researchResult.status === 'failed') {
+        const rewound = await this.adapter.rewindOnFailure(researchResult);
+        if (rewound) {
+          const rewindEvent = createEvent(runId, 'orchestrator', 'state_change',
+            `Research workspace rolled back via file checkpoint`, { phase: 'rewind' });
+          allEvents.push(rewindEvent);
+          appendEvent(projectSlug, runId, rewindEvent);
+        }
+      }
+
+      const researchDoneEvent = createEvent(runId, lens.name, 'state_change',
         `Research phase ${researchResult.status}`, {
           phase: 'research_done',
           status: researchResult.status,
         });
       allEvents.push(researchDoneEvent);
-      this.appendEvent(projectSlug, runId, researchDoneEvent);
+      appendEvent(projectSlug, runId, researchDoneEvent);
     }
 
     // ─── Production Phase ───
-    const prodEvent = this.createEvent(runId, lens.name, 'state_change',
+    const prodEvent = createEvent(runId, lens.name, 'state_change',
       `Entering production phase`, { phase: 'producing' });
     allEvents.push(prodEvent);
-    this.appendEvent(projectSlug, runId, prodEvent);
+    appendEvent(projectSlug, runId, prodEvent);
 
     const productionPrompt = buildProductionPrompt(
       lens, taskPrompt, researchOutput, priorLensOutput,
     );
-    const systemPrompt = buildLensSystemPrompt(lens);
 
     const productionResult = await this.adapter.spawn(
       productionPrompt,
       lens.tools,
       {
-        systemPrompt,
-        run_id: runId,
-        lens_name: lens.name,
-        cwd: lensWorkspace,
+        ...baseContext,
         researchOutput,
         priorLensOutput,
         feedback,
       },
     );
+
+    // If production failed, attempt workspace rollback via file checkpoint
+    if (productionResult.status === 'failed') {
+      const rewound = await this.adapter.rewindOnFailure(productionResult);
+      if (rewound) {
+        const rewindEvent = createEvent(runId, 'orchestrator', 'state_change',
+          `Production workspace rolled back via file checkpoint`, { phase: 'rewind' });
+        allEvents.push(rewindEvent);
+        appendEvent(projectSlug, runId, rewindEvent);
+      }
+    }
 
     // Save production output
     const outputDir = path.join(
@@ -151,18 +175,18 @@ export class LensManager {
 
     allEvents.push(...productionResult.events);
     for (const e of productionResult.events) {
-      this.appendEvent(projectSlug, runId, e);
+      appendEvent(projectSlug, runId, e);
     }
 
     // Emit completion event
-    const doneEvent = this.createEvent(runId, 'orchestrator', 'state_change',
+    const doneEvent = createEvent(runId, 'orchestrator', 'state_change',
       `Lens ${lens.name} finished: ${productionResult.status}`, {
         lens_id: lens.id,
         phase: 'done',
         status: productionResult.status,
       });
     allEvents.push(doneEvent);
-    this.appendEvent(projectSlug, runId, doneEvent);
+    appendEvent(projectSlug, runId, doneEvent);
 
     return {
       lens,
@@ -183,6 +207,7 @@ export class LensManager {
     timeoutMs: number,
   ): Promise<AgentResult> {
     let agentId: string | undefined;
+    let timedOut = false;
 
     const spawnPromise = this.adapter.spawn(prompt, tools, context).then(result => {
       agentId = result.id;
@@ -190,28 +215,39 @@ export class LensManager {
     });
 
     const timeoutPromise = new Promise<AgentResult>((resolve) => {
-      setTimeout(async () => {
+      setTimeout(() => {
+        timedOut = true;
+
+        // Use AbortController directly — works even if spawn hasn't resolved yet.
+        // This is the fix for the race condition: kill(id) requires agentId which
+        // may not be set yet. AbortController aborts the underlying SDK query.
         if (agentId) {
-          await this.adapter.kill(agentId);
+          const controller = this.adapter.getAbortController(agentId);
+          if (controller) controller.abort();
         }
+        // If agentId isn't set yet, the spawn will complete and find timedOut=true
+
         resolve({
           id: agentId || uuid(),
           status: 'failed',
           output: 'Research phase timed out. Partial output may be available in workspace.',
-          events: [{
-            id: uuid(),
-            timestamp: new Date().toISOString(),
-            run_id: context.run_id || '',
-            actor: context.lens_name || 'unknown',
-            type: 'error',
-            content: `Research phase exceeded ${timeoutMs / 1000}s limit`,
-            metadata: { timeout: true },
-          }],
+          events: [createEvent(
+            context.run_id || '', context.lens_name || 'unknown', 'error',
+            `Research phase exceeded ${timeoutMs / 1000}s limit`,
+            { timeout: true },
+          )],
         });
       }, timeoutMs);
     });
 
-    return Promise.race([spawnPromise, timeoutPromise]);
+    const result = await Promise.race([spawnPromise, timeoutPromise]);
+
+    // If spawn resolved after timeout, clean up the ghost agent
+    if (timedOut && agentId) {
+      await this.adapter.kill(agentId);
+    }
+
+    return result;
   }
 
   /**
@@ -261,35 +297,5 @@ export class LensManager {
 
     fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2));
     return meta;
-  }
-
-  // ─── Event Helpers ───
-
-  private createEvent(
-    runId: string,
-    actor: string,
-    type: WorkflowEvent['type'],
-    content: string,
-    metadata?: Record<string, any>,
-    ref?: string,
-  ): WorkflowEvent {
-    return {
-      id: uuid(),
-      timestamp: new Date().toISOString(),
-      run_id: runId,
-      actor,
-      type,
-      content,
-      metadata,
-      ref,
-    };
-  }
-
-  private appendEvent(projectSlug: string, runId: string, event: WorkflowEvent): void {
-    const eventsFile = path.join(
-      this.worldBenchRoot, 'projects', projectSlug, 'runs', runId, 'events.jsonl',
-    );
-    fs.mkdirSync(path.dirname(eventsFile), { recursive: true });
-    fs.appendFileSync(eventsFile, JSON.stringify(event) + '\n');
   }
 }

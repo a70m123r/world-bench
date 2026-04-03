@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "slack": {
+      "command": "npx",
+      "args": ["tsx", "D:\\OpenClawWorkspace\\world-bench\\mcp-servers\\slack-mcp-server\\src\\index.ts"],
+      "env": {
+        "SLACK_BOT_TOKEN": "${SLACK_BOT_TOKEN}"
+      }
+    },
+    "memory": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-memory"],
+      "env": {
+        "MEMORY_FILE_PATH": "D:\\OpenClawWorkspace\\world-bench\\orchestrator\\memory\\knowledge-graph.jsonl"
+      }
+    }
+  }
+}
