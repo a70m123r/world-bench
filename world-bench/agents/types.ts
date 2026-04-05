@@ -102,12 +102,14 @@ export interface AgentResult {
   events: WorkflowEvent[];
 }
 
-/** Claude-specific extension for file checkpoint rollback */
+/** Claude-specific extension for file checkpoint rollback + session resume */
 export interface ClaudeAgentResult extends AgentResult {
   rewindContext?: {
     query: any;
     lastUserMessageId: string;
   };
+  /** Lens session ID for resume support (v0.5) */
+  sessionId?: string;
 }
 
 export interface AgentAdapter {

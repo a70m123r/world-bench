@@ -29,6 +29,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
     const events: WorkflowEvent[] = [];
     let output = '';
     let lastUserMessageId: string | undefined;
+    let lensSessionId: string | undefined;
 
     try {
       const fullPrompt = buildLensPrompt(prompt, context);
@@ -45,6 +46,9 @@ export class ClaudeAgentAdapter implements AgentAdapter {
 
         // Native feature: file checkpointing for rollback on failure
         enableFileCheckpointing: true,
+
+        // v0.5: resume lens from previous session if available
+        ...(context.resumeSessionId ? { resume: context.resumeSessionId } : {}),
 
         // Native feature: PostToolUse hook for automatic event logging
         hooks: this.buildHooks(context),
@@ -75,6 +79,11 @@ export class ClaudeAgentAdapter implements AgentAdapter {
 
       for await (const message of q) {
         if (abortController.signal.aborted) break;
+
+        // Capture lens session ID for resume support
+        if (message.type === 'system' && (message as any).subtype === 'init') {
+          lensSessionId = (message as any).session_id;
+        }
 
         // Track user message IDs for file checkpointing rewind targets
         if (message.type === 'user' && (message as any).message?.id) {
@@ -108,12 +117,14 @@ export class ClaudeAgentAdapter implements AgentAdapter {
       );
       events.push(doneEvent);
 
-      return {
+      const result: ClaudeAgentResult = {
         id: agentId,
         status: 'completed',
         output: output || messages.join('\n\n'),
         events,
+        sessionId: lensSessionId,
       };
+      return result;
     } catch (error: any) {
       // Lifecycle event: failure
       const errorEvent = createEvent(

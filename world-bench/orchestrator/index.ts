@@ -403,7 +403,8 @@ export class Orchestrator {
 
   /**
    * Conversational handler — talk to Pav like a person.
-   * Uses Claude to decide: chat, create a project, list status, etc.
+   * v0.5: Claude talks naturally. Actions expressed via tool_use blocks,
+   * not JSON-in-system-prompt. No more regex parsing.
    */
   private async converse(cmd: OrchestratorCommand): Promise<{
     reply: string;
@@ -444,32 +445,31 @@ You have a personal knowledge graph via the "memory" MCP server. Use it:
 - Store things useful to your future self waking up cold
 Key tools: create_entities, add_observations, create_relations, search_nodes, open_nodes
 
-RESPONSE FORMAT — you MUST respond with valid JSON only, no other text:
+## Actions
+When you want to DO something (not just chat), use the Write tool to write a JSON action file to the workspace. This is how you express structured intent.
+
+To create a project, write a file to \`${WORLD_BENCH_ROOT}/orchestrator/action.json\` with this format:
 {
-  "reply": "your conversational message to Pav (markdown formatted for Slack)",
-  "action": "chat" | "create_project" | "status",
-  "plan": null or { "projectName": "...", "projectSlug": "...", "taskPrompt": "...", "lenses": [...] }
+  "action": "create_project",
+  "projectName": "...",
+  "projectSlug": "...",
+  "taskPrompt": "...",
+  "lenses": [
+    {
+      "id": "slug",
+      "name": "Display Name",
+      "purpose": "what this lens does",
+      "systemPrompt": "full instructions for the lens agent",
+      "tools": ["WebSearch", "WebFetch"] or [],
+      "slackPersona": { "username": "Name", "icon_emoji": ":emoji:" },
+      "inputContract": { "description": "", "fields": {} },
+      "outputContract": { "description": "", "fields": {} },
+      "researchPhase": { "enabled": true/false, "prompt": "research instructions", "maxDuration": 120 }
+    }
+  ]
 }
 
-Action rules:
-- "chat": for conversation, questions, clarification, banter. No plan needed.
-- "create_project": when Pav asks you to DO something — research, create, analyze, find. Include the plan.
-- "status": when Pav asks about existing projects or system state. No plan needed.
-
-For "create_project", the plan.lenses array should contain lens configs:
-{
-  "id": "slug",
-  "name": "Display Name",
-  "purpose": "what this lens does",
-  "systemPrompt": "full instructions for the lens agent",
-  "tools": ["WebSearch", "WebFetch"] or [],
-  "slackPersona": { "username": "Name", "icon_emoji": ":emoji:" },
-  "inputContract": { "description": "", "fields": {} },
-  "outputContract": { "description": "", "fields": {} },
-  "researchPhase": { "enabled": true/false, "prompt": "research instructions", "maxDuration": 120 }
-}
-
-Be conversational in your reply. If Pav says "hey" — say hey back. If he asks a question — answer it. Only create a project when he's actually asking for work to be done.
+Be conversational in your text output. If someone says "hey" — say hey back. If they ask a question — answer it. Only create a project action when they're actually asking for work to be done.
 
 ## Situational Awareness
 You're responding to a message in Slack channel: ${cmd.channel_id}
@@ -523,6 +523,8 @@ If you're in a lens channel (#wb-lens-*), read its history to understand what th
         'mcp__slack__slack_user_info',
         'mcp__slack__slack_react',
         'mcp__slack__slack_create_canvas',
+        // File tools — for writing action files
+        'Read', 'Write', 'Edit', 'Glob', 'Grep',
       ];
     }
 
@@ -551,7 +553,7 @@ If you're in a lens channel (#wb-lens-*), read its history to understand what th
           console.log(`[Orchestrator] Session: ${session.sessionId}`);
         }
 
-        // Log all message types for visibility
+        // Collect text + log tools
         if (msg.type === 'assistant' && msg.message) {
           if (typeof msg.message === 'string') {
             messages.push(msg.message);
@@ -569,12 +571,7 @@ If you're in a lens channel (#wb-lens-*), read its history to understand what th
               }
             }
           }
-        } else if (msg.type === 'tool_result' || (msg as any).type === 'tool_use') {
-          // Some SDK versions emit tool events at the top level
-          const name = (msg as any).name || (msg as any).tool_name || '';
-          if (name) console.log(`[Orchestrator] Tool: ${name}`);
-        } else if (msg.type !== 'system' && msg.type !== 'result') {
-          // Log unexpected message types so we can see what the SDK sends
+        } else if (msg.type !== 'system' && msg.type !== 'result' && msg.type !== 'user') {
           console.log(`[Orchestrator] Event: ${msg.type}${(msg as any).subtype ? '/' + (msg as any).subtype : ''}`);
         }
       }
@@ -582,47 +579,47 @@ If you're in a lens channel (#wb-lens-*), read its history to understand what th
     session.lastActivity = new Date();
     this.saveSessionsToDisk();
 
-    const responseText = messages.join('');
+    // Check if the Orchestrator wrote an action file
+    const actionPath = path.join(WORLD_BENCH_ROOT, 'orchestrator', 'action.json');
+    let action: 'chat' | 'create_project' | 'status' = 'chat';
+    let plan: any = undefined;
 
-    // Parse the JSON response — strip code fences first, then extract
-    const parsed = extractJSON(responseText);
-    if (!parsed) {
-      // Fallback: treat entire response as conversational chat
-      return { reply: responseText || "I'm here. What do you need?", action: 'chat' };
-    }
+    if (fs.existsSync(actionPath)) {
+      try {
+        const actionData = JSON.parse(fs.readFileSync(actionPath, 'utf-8'));
+        fs.unlinkSync(actionPath); // consume it — one-shot
 
-    try {
+        if (actionData.action === 'create_project' && actionData.lenses?.length > 0) {
+          action = 'create_project';
 
-      // Hydrate lens configs with stem cell defaults
-      if (parsed.plan?.lenses) {
-        parsed.plan.lenses = parsed.plan.lenses.map((l: any) => ({
-          ...l,
-          state: 'active' as const,
-          tools: l.tools || [],
-          permissions: {
-            tier: 'stem' as const,
-            allowed: [...STEM_CELL_ALLOWED],
-            denied: [...STEM_CELL_DENIED],
-            granted: [],
-            stableRunCount: 0,
-            observedTools: [],
-          },
-          slackPersona: l.slackPersona || { username: l.name, icon_emoji: ':gear:' },
-          inputContract: l.inputContract || { description: '', fields: {} },
-          outputContract: l.outputContract || { description: '', fields: {} },
-          researchPhase: l.researchPhase || { enabled: false, prompt: '', maxDuration: 120 },
-        }));
+          // Hydrate lens configs with stem cell defaults
+          actionData.lenses = actionData.lenses.map((l: any) => ({
+            ...l,
+            state: 'active' as const,
+            tools: l.tools || [],
+            permissions: {
+              tier: 'stem' as const,
+              allowed: [...STEM_CELL_ALLOWED],
+              denied: [...STEM_CELL_DENIED],
+              granted: [],
+              stableRunCount: 0,
+              observedTools: [],
+            },
+            slackPersona: l.slackPersona || { username: l.name, icon_emoji: ':gear:' },
+            inputContract: l.inputContract || { description: '', fields: {} },
+            outputContract: l.outputContract || { description: '', fields: {} },
+            researchPhase: l.researchPhase || { enabled: false, prompt: '', maxDuration: 120 },
+          }));
+
+          plan = actionData;
+        }
+      } catch (e: any) {
+        console.warn(`[Orchestrator] Failed to parse action file: ${e.message}`);
       }
-
-      return {
-        reply: parsed.reply || "I'm here.",
-        action: parsed.action || 'chat',
-        plan: parsed.plan || undefined,
-      };
-    } catch {
-      // JSON parse failed — treat as plain conversational text
-      return { reply: responseText || "I'm here. What do you need?", action: 'chat' };
     }
+
+    const reply = messages.join('') || "I'm here. What do you need?";
+    return { reply, action, plan };
   }
 
 }

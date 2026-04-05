@@ -74,6 +74,18 @@ export class LensManager {
     const effectiveTools = this.permissionManager.getEffectiveTools(lens);
     const deniedTools = [...(lens.permissions?.denied || STEM_CELL_DENIED)];
 
+    // v0.5: load lens session ID for resume support
+    const lensJsonPath = path.join(
+      this.worldBenchRoot, 'projects', projectSlug, 'lenses', lens.id, 'lens.json',
+    );
+    let resumeSessionId: string | undefined;
+    try {
+      if (fs.existsSync(lensJsonPath)) {
+        const lensData = JSON.parse(fs.readFileSync(lensJsonPath, 'utf-8'));
+        resumeSessionId = lensData.sessionId;
+      }
+    } catch { }
+
     const baseContext = {
       systemPrompt: buildLensSystemPrompt(lens),
       run_id: runId,
@@ -82,6 +94,7 @@ export class LensManager {
       cwd: lensWorkspace,
       projectSlug,
       deniedTools,
+      resumeSessionId,
     };
 
     // ─── Research Phase ───
@@ -167,6 +180,18 @@ export class LensManager {
         allEvents.push(rewindEvent);
         appendEvent(projectSlug, runId, rewindEvent);
       }
+    }
+
+    // v0.5: persist lens session ID for resume on next run
+    const prodSessionId = (productionResult as any).sessionId;
+    if (prodSessionId) {
+      try {
+        const lensData = fs.existsSync(lensJsonPath)
+          ? JSON.parse(fs.readFileSync(lensJsonPath, 'utf-8'))
+          : { ...lens };
+        lensData.sessionId = prodSessionId;
+        fs.writeFileSync(lensJsonPath, JSON.stringify(lensData, null, 2));
+      } catch { }
     }
 
     // Save production output
