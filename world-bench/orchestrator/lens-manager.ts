@@ -29,6 +29,7 @@ export interface LensRunResult {
   researchResult?: AgentResult;
   productionResult?: AgentResult;
   events: WorkflowEvent[];
+  hardeningSuggestion?: string; // Set when tool usage has converged
 }
 
 export class LensManager {
@@ -95,6 +96,8 @@ export class LensManager {
       projectSlug,
       deniedTools,
       resumeSessionId,
+      permissionManager: this.permissionManager,
+      lensConfig: lens,
     };
 
     // ─── Research Phase ───
@@ -213,12 +216,14 @@ export class LensManager {
     }
 
     // Track tool usage for permission hardening
+    let hardeningSuggestion: string | undefined;
     if (productionResult.status === 'completed') {
       const runTools = allEvents
         .filter(e => e.actor === lens.name && e.type === 'message' && e.metadata?.tool)
         .map(e => e.metadata!.tool as string);
       const hardening = this.permissionManager.updateToolUsage(lens, projectSlug, runTools);
       if (hardening.suggest) {
+        hardeningSuggestion = hardening.message;
         const hardenEvent = createEvent(runId, 'orchestrator', 'state_change',
           hardening.message || 'Lens ready for hardening',
           { lens_id: lens.id, phase: 'hardening_suggestion' });
@@ -242,6 +247,7 @@ export class LensManager {
       researchResult,
       productionResult,
       events: allEvents,
+      hardeningSuggestion,
     };
   }
 

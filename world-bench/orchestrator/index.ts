@@ -328,6 +328,13 @@ export class Orchestrator {
         // Chain output: pass this lens's output to the next lens
         priorOutput = result.productionResult?.output;
       }
+
+      // Surface hardening suggestion to Pav
+      if (result.hardeningSuggestion) {
+        await this.terminal.postToProject(projectSlug,
+          `:lock: *Permission hardening available:* ${result.hardeningSuggestion}\n_Reply "harden it" to lock, or ignore to keep shaping._`,
+        );
+      }
     }
 
     // Finalize run
@@ -355,6 +362,45 @@ export class Orchestrator {
     lines.push('_Full output in each lens channel. Dive in for details._');
 
     return lines.join('\n');
+  }
+
+  // ─── Lens Resume ───
+
+  /**
+   * Resume a lens from its last session with new context/feedback.
+   */
+  async resumeLens(
+    projectSlug: string,
+    lensId: string,
+    newContext: string,
+  ): Promise<LensRunResult | null> {
+    const lensJsonPath = path.join(WORLD_BENCH_ROOT, 'projects', projectSlug, 'lenses', lensId, 'lens.json');
+    if (!fs.existsSync(lensJsonPath)) {
+      console.error(`[Orchestrator] Lens not found: ${projectSlug}/${lensId}`);
+      return null;
+    }
+
+    const lens: LensConfig = JSON.parse(fs.readFileSync(lensJsonPath, 'utf-8'));
+    const runId = uuid();
+
+    this.lensManager.initRun(projectSlug, runId, [lens]);
+
+    await this.terminal.postToProject(projectSlug,
+      `Resuming lens **${lens.name}** with new context...`,
+    );
+
+    const result = await this.lensManager.runLens(
+      lens, projectSlug, runId, newContext,
+    );
+
+    this.lensManager.finalizeRun(projectSlug, runId, [result]);
+
+    const status = result.productionResult?.status || 'unknown';
+    await this.terminal.postToProject(projectSlug,
+      `Lens **${lens.name}** resumed: \`${status}\``,
+    );
+
+    return result;
   }
 
   // ─── Command Handling (called by Terminal) ───
@@ -394,6 +440,17 @@ export class Orchestrator {
         await this.terminal.postToChannel(replyTo,
           `Done. Check \`#wb-proj-${plan.projectSlug}\` for results.`,
         );
+      }
+
+      // Resume a lens with new context
+      if ((response.action as string) === 'resume_lens' && response.plan) {
+        const { projectSlug, lensId, newContext } = response.plan;
+        if (projectSlug && lensId) {
+          await this.terminal.postToChannel(replyTo,
+            `Resuming lens \`${lensId}\` in project \`${projectSlug}\`...`,
+          );
+          await this.resumeLens(projectSlug, lensId, newContext || 'Continue from where you left off.');
+        }
       }
     } catch (error: any) {
       await this.terminal.removeThinkingReaction(replyTo, cmd.ts);
@@ -612,9 +669,14 @@ If you're in a lens channel (#wb-lens-*), read its history to understand what th
           }));
 
           plan = actionData;
+        } else if (actionData.action === 'resume_lens') {
+          // Resume a lens with new context
+          action = 'resume_lens' as any;
+          plan = actionData;
         }
       } catch (e: any) {
-        console.warn(`[Orchestrator] Failed to parse action file: ${e.message}`);
+        console.error(`[Orchestrator] Failed to parse action file: ${e.message}`);
+        // Don't swallow — log so it shows in terminal
       }
     }
 

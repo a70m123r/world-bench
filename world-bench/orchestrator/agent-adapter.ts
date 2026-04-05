@@ -5,8 +5,9 @@
 
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { v4 as uuid } from 'uuid';
-import { AgentAdapter, AgentResult, ClaudeAgentResult, WorkflowEvent } from '../agents/types';
+import { AgentAdapter, AgentResult, ClaudeAgentResult, LensConfig, WorkflowEvent } from '../agents/types';
 import { appendEvent, createEvent } from './event-log';
+import { PermissionManager } from './permission-manager';
 
 export class ClaudeAgentAdapter implements AgentAdapter {
   private activeQueries: Map<string, { abort: AbortController; query: any }> = new Map();
@@ -206,34 +207,67 @@ export class ClaudeAgentAdapter implements AgentAdapter {
     const lensName = context.lens_name || 'unknown';
     const projectSlug = context.projectSlug || '';
     const deniedTools: string[] = context.deniedTools || [];
+    const permissionManager: PermissionManager | undefined = context.permissionManager;
+    const lensConfig: LensConfig | undefined = context.lensConfig;
 
     return {
-      // Permission enforcement — deny tools not in the lens's allowlist
+      // Permission enforcement via elevation loop
       PreToolUse: [{
         hooks: [async (input: any) => {
           const toolName = input.tool_name || '';
 
-          // Check if tool is explicitly denied
-          if (deniedTools.includes(toolName)) {
-            console.log(`[AgentAdapter] DENIED tool: ${toolName} for ${lensName}`);
-
-            if (runId && projectSlug) {
-              const event = createEvent(
-                runId, lensName, 'elevation_request',
-                `Lens "${lensName}" requested denied tool: ${toolName}`,
-                { tool: toolName, lens_name: lensName },
-              );
-              try { appendEvent(projectSlug, runId, event); } catch { }
-            }
-
-            return {
-              hookEventName: 'PreToolUse',
-              permissionDecision: 'deny',
-              additionalContext: `Tool "${toolName}" is not available. Work within your current toolset.`,
-            };
+          // If tool is not in the denied list, allow it
+          if (!deniedTools.includes(toolName)) {
+            return { hookEventName: 'PreToolUse', permissionDecision: 'defer' };
           }
 
-          return { hookEventName: 'PreToolUse', permissionDecision: 'defer' };
+          // Tool is denied — run the elevation loop
+          console.log(`[AgentAdapter] Denied tool requested: ${toolName} by ${lensName}`);
+
+          if (permissionManager && lensConfig && runId && projectSlug) {
+            const evaluation = permissionManager.evaluateElevation(lensConfig, toolName);
+
+            if (evaluation.decision === 'grant') {
+              // Auto-grant: tool aligns with lens purpose
+              console.log(`[AgentAdapter] ELEVATED: ${toolName} for ${lensName} — ${evaluation.reason}`);
+              permissionManager.grantTool(lensConfig, toolName, projectSlug, runId, 'orchestrator');
+              // Remove from denied so subsequent calls don't re-evaluate
+              const idx = deniedTools.indexOf(toolName);
+              if (idx >= 0) deniedTools.splice(idx, 1);
+              return {
+                hookEventName: 'PreToolUse',
+                permissionDecision: 'allow',
+                additionalContext: `Tool "${toolName}" granted: ${evaluation.reason}`,
+              };
+            }
+
+            if (evaluation.decision === 'escalate') {
+              // Ambiguous — log escalation event for Pav to review
+              console.log(`[AgentAdapter] ESCALATE: ${toolName} for ${lensName} — ${evaluation.reason}`);
+              const event = createEvent(
+                runId, lensName, 'elevation_request',
+                `Needs Pav: ${evaluation.reason}`,
+                { tool: toolName, lens_name: lensName, decision: 'escalate', reason: evaluation.reason },
+              );
+              try { appendEvent(projectSlug, runId, event); } catch { }
+              // Deny for now — Pav can grant later
+              return {
+                hookEventName: 'PreToolUse',
+                permissionDecision: 'deny',
+                additionalContext: `Tool "${toolName}" requires approval. Request logged for Pav.`,
+              };
+            }
+
+            // Explicit deny
+            console.log(`[AgentAdapter] DENIED: ${toolName} for ${lensName} — ${evaluation.reason}`);
+            permissionManager.denyTool(lensConfig, toolName, projectSlug, runId, 'orchestrator', evaluation.reason);
+          }
+
+          return {
+            hookEventName: 'PreToolUse',
+            permissionDecision: 'deny',
+            additionalContext: `Tool "${toolName}" is not available for this lens.`,
+          };
         }],
       }],
 

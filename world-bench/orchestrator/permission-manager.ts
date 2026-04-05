@@ -273,6 +273,8 @@ export class PermissionManager {
     );
     try {
       fs.writeFileSync(lensJsonPath, JSON.stringify(lens, null, 2));
-    } catch { }
+    } catch (e: any) {
+      console.error(`[PermissionManager] Failed to save lens config for ${lens.id}: ${e.message}`);
+    }
   }
 }
