@@ -47,9 +47,10 @@ export class Orchestrator {
   }
 
   /** Called by Terminal after Slack client is ready */
-  initContextProvider(client: any, orchestratorChannelId: string): void {
+  initContextProvider(client: any, orchestratorChannelId: string, botUserId: string): void {
     this.contextProvider = new ContextProvider(client);
     this.contextProvider.setOrchestratorChannel(orchestratorChannelId);
+    this.contextProvider.setBotUserId(botUserId);
     console.log('[Orchestrator] Context provider initialized.');
   }
 
@@ -452,6 +453,19 @@ export class Orchestrator {
           await this.resumeLens(projectSlug, lensId, newContext || 'Continue from where you left off.');
         }
       }
+      // Write personal breadcrumb (bridge-mechanical — no agent narration)
+      if (this.contextProvider) {
+        const toolsUsed: string[] = []; // TODO: collect from converse() tool_use blocks
+        this.contextProvider.appendBreadcrumb(
+          replyTo,
+          cmd.thread_ts,
+          cmd.user_id,
+          toolsUsed,
+          response.reply.length,
+        );
+        // Mark mentions answered in this channel/thread
+        this.contextProvider.markMentionAnswered(replyTo, cmd.thread_ts);
+      }
     } catch (error: any) {
       await this.terminal.removeThinkingReaction(replyTo, cmd.ts);
       await this.terminal.postToChannel(replyTo, `Something went wrong: ${error.message}`);
@@ -588,7 +602,7 @@ If you're in a lens channel (#wb-lens-*), read its history to understand what th
     // Pre-fetch situational context (same as Veil/Soren)
     let contextPreamble = '';
     if (this.contextProvider) {
-      contextPreamble = await this.contextProvider.buildContext(cmd.channel_id, cmd.thread_ts);
+      contextPreamble = await this.contextProvider.buildContext(cmd.channel_id, cmd.thread_ts, cmd.ts);
     }
 
     // Prepend context to the user's message

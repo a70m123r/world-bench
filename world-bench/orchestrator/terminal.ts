@@ -132,7 +132,7 @@ export class Terminal {
 
     // Initialize context provider with Slack client
     if (this.orchestratorChannelId) {
-      this.orchestrator.initContextProvider(this.client, this.orchestratorChannelId);
+      this.orchestrator.initContextProvider(this.client, this.orchestratorChannelId, this.botUserId!);
     }
 
     // Announce presence
