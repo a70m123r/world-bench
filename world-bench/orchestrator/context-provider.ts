@@ -1,6 +1,7 @@
-// World-Bench v0.4 — Context Provider
+// World-Bench v0.5.1 — Context Provider
 // Pre-fetches Slack messages and council docs, injects into every prompt.
-// Same pattern as Veil/Soren's context-provider.ts.
+// v0.5.1: Caches messages per channel — only fetches new messages since last call.
+// Eliminates redundant 350-message fetches that cause rate_limit_event spam.
 
 import { WebClient } from '@slack/web-api';
 import * as fs from 'fs';
@@ -11,11 +12,10 @@ const COUNCIL_DIR = path.resolve(WORLD_BENCH_ROOT, '..', 'council');
 const BREADCRUMBS_PATH = path.join(COUNCIL_DIR, 'BREADCRUMBS.md');
 const ROOM_STATE_PATH = path.join(COUNCIL_DIR, 'ROOM-ZERO-STATE.md');
 
-// Hard limits — same depth as Veil/Soren
-const ROOM_ZERO_MESSAGES = 150;
-const CURRENT_CHANNEL_MESSAGES = 100;
-const ORCHESTRATOR_CHANNEL_MESSAGES = 100;
-const BREADCRUMBS_TAIL_CHARS = 20000;
+// Max messages to keep per channel in cache
+const MAX_CACHED_MESSAGES = 150;
+// Only do a full refresh if cache is older than this
+const FULL_REFRESH_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
 const CONTEXT_TIMEOUT_MS = 10000;
 
 // Known channels
@@ -23,14 +23,22 @@ const ROOM_ZERO_CHANNEL = 'C0ALN8Q6QRE';
 
 interface SlackMessage {
   timestamp: string;
+  rawTs: string; // original Slack ts for oldest/latest queries
   username: string;
   text: string;
+}
+
+interface ChannelCache {
+  messages: SlackMessage[];
+  lastFetchTs: string; // Slack ts of the newest message we've seen
+  lastFullFetch: number; // Date.now() of last full refresh
 }
 
 export class ContextProvider {
   private client: WebClient;
   private orchestratorChannelId: string | null = null;
   private userCache: Map<string, string> = new Map();
+  private channelCaches: Map<string, ChannelCache> = new Map();
 
   constructor(client: WebClient) {
     this.client = client;
@@ -42,7 +50,7 @@ export class ContextProvider {
 
   /**
    * Build full situational context for the Orchestrator.
-   * Injected before every Claude call — no tool calls needed.
+   * Uses cached messages — only fetches new ones since last call.
    */
   async buildContext(
     currentChannel: string,
@@ -55,7 +63,8 @@ export class ContextProvider {
           setTimeout(() => reject(new Error('Context fetch timeout')), CONTEXT_TIMEOUT_MS)
         ),
       ]);
-    } catch {
+    } catch (e: any) {
+      console.warn(`[ContextProvider] Context fetch failed: ${e.message}`);
       return '';
     }
   }
@@ -70,38 +79,47 @@ export class ContextProvider {
 
     const fetches: Promise<{ label: string; messages: SlackMessage[] } | null>[] = [];
 
-    // 1. Room Zero — 150 messages (skip if we're already there)
+    // 1. Room Zero (skip if current)
     if (!isRoomZero) {
       fetches.push(
-        this.fetchHistory(ROOM_ZERO_CHANNEL, ROOM_ZERO_MESSAGES)
-          .then(messages => ({ label: `Room Zero (#room-zero) — Last ${ROOM_ZERO_MESSAGES} messages`, messages }))
+        this.getChannelMessages(ROOM_ZERO_CHANNEL, MAX_CACHED_MESSAGES)
+          .then(messages => ({ label: `Room Zero (#room-zero) — ${messages.length} messages`, messages }))
           .catch(() => null)
       );
     }
 
-    // 2. Current channel/thread — 100 messages
-    fetches.push(
-      this.fetchConversation(currentChannel, currentThreadTs, CURRENT_CHANNEL_MESSAGES)
-        .then(messages => ({ label: `Current Channel/Thread — Last ${CURRENT_CHANNEL_MESSAGES} messages`, messages }))
-        .catch(() => null)
-    );
+    // 2. Current channel/thread
+    if (currentThreadTs) {
+      // Threads aren't cached — fetch fresh (usually small)
+      fetches.push(
+        this.fetchThread(currentChannel, currentThreadTs, 100)
+          .then(messages => ({ label: `Current Thread — ${messages.length} messages`, messages }))
+          .catch(() => null)
+      );
+    } else {
+      fetches.push(
+        this.getChannelMessages(currentChannel, 100)
+          .then(messages => ({ label: `Current Channel — ${messages.length} messages`, messages }))
+          .catch(() => null)
+      );
+    }
 
-    // 3. #wb-orchestrator — 100 messages (skip if we're already there)
+    // 3. #wb-orchestrator (skip if current)
     if (!isOrchestratorChannel && this.orchestratorChannelId) {
       fetches.push(
-        this.fetchHistory(this.orchestratorChannelId, ORCHESTRATOR_CHANNEL_MESSAGES)
-          .then(messages => ({ label: `#wb-orchestrator — Last ${ORCHESTRATOR_CHANNEL_MESSAGES} messages`, messages }))
+        this.getChannelMessages(this.orchestratorChannelId, 100)
+          .then(messages => ({ label: `#wb-orchestrator — ${messages.length} messages`, messages }))
           .catch(() => null)
       );
     }
 
-    // Council breadcrumbs
-    const breadcrumbs = this.readFileTail(BREADCRUMBS_PATH, BREADCRUMBS_TAIL_CHARS);
+    // Council breadcrumbs (file — always fresh, cheap to read)
+    const breadcrumbs = this.readFileTail(BREADCRUMBS_PATH, 20000);
     if (breadcrumbs) {
       sections.push(`## Council Breadcrumbs (recent cross-thread activity):\n${breadcrumbs}`);
     }
 
-    // Room Zero state
+    // Room Zero state (file)
     const roomState = this.readFile(ROOM_STATE_PATH, 3000);
     if (roomState) {
       sections.push(`## Room Zero State:\n${roomState}`);
@@ -127,23 +145,75 @@ export class ContextProvider {
     );
   }
 
+  // ─── Cached Channel Fetch ───
+
+  /**
+   * Get channel messages from cache. Only fetches new messages since last call.
+   * Full refresh every 10 minutes to catch edits/deletes.
+   */
+  private async getChannelMessages(channel: string, limit: number): Promise<SlackMessage[]> {
+    const cache = this.channelCaches.get(channel);
+    const now = Date.now();
+
+    if (!cache) {
+      // Full fetch — cold start only
+      const messages = await this.fetchHistory(channel, limit);
+      this.channelCaches.set(channel, {
+        messages,
+        lastFetchTs: messages.length > 0 ? messages[messages.length - 1].rawTs : '0',
+        lastFullFetch: now,
+      });
+      return messages;
+    }
+
+    // Incremental fetch — only new messages since last fetch
+    try {
+      const response = await this.client.conversations.history({
+        channel,
+        oldest: cache.lastFetchTs,
+        limit: 50, // small batch — just the new stuff
+      });
+
+      if (response.ok && response.messages && response.messages.length > 0) {
+        // Filter out the message at oldest (it's inclusive)
+        const newRaw = response.messages.filter(m => m.ts !== cache.lastFetchTs);
+        if (newRaw.length > 0) {
+          const newMessages = await this.resolveMessages(newRaw.reverse());
+          cache.messages.push(...newMessages);
+
+          // Trim to max
+          if (cache.messages.length > MAX_CACHED_MESSAGES) {
+            cache.messages = cache.messages.slice(-MAX_CACHED_MESSAGES);
+          }
+
+          cache.lastFetchTs = cache.messages[cache.messages.length - 1].rawTs;
+          console.log(`[ContextProvider] ${channel}: +${newMessages.length} new messages (${cache.messages.length} cached)`);
+        }
+      }
+    } catch (e: any) {
+      // Incremental fetch failed — serve stale cache
+      console.warn(`[ContextProvider] Incremental fetch failed for ${channel}: ${e.message}`);
+    }
+
+    return cache.messages.slice(-limit);
+  }
+
+  // ─── Raw Fetchers ───
+
   private async fetchHistory(channel: string, limit: number): Promise<SlackMessage[]> {
     const response = await this.client.conversations.history({ channel, limit });
     if (!response.ok || !response.messages) return [];
     return this.resolveMessages(response.messages.reverse());
   }
 
-  private async fetchConversation(
-    channel: string, threadTs: string | undefined, limit: number,
+  private async fetchThread(
+    channel: string, threadTs: string, limit: number,
   ): Promise<SlackMessage[]> {
-    if (threadTs) {
-      const response = await this.client.conversations.replies({
-        channel, ts: threadTs, limit,
-      });
-      if (!response.ok || !response.messages) return [];
-      return this.resolveMessages(response.messages.slice(-limit));
-    }
-    return this.fetchHistory(channel, limit);
+    const response = await this.client.conversations.replies({
+      channel, ts: threadTs, limit,
+    });
+    if (!response.ok || !response.messages) return [];
+    return this.resolveMessages(response.messages.slice(-limit));
   }
 
   private async resolveMessages(
@@ -168,6 +238,7 @@ export class ContextProvider {
 
       resolved.push({
         timestamp: timeStr,
+        rawTs: msg.ts,
         username,
         text: msg.text.replace(/\n/g, ' ').substring(0, 500),
       });
