@@ -11,6 +11,8 @@ import {
   ProjectMeta,
   WorkflowEvent,
   OrchestratorCommand,
+  STEM_CELL_ALLOWED,
+  STEM_CELL_DENIED,
 } from '../agents/types';
 import { ClaudeAgentAdapter } from './agent-adapter';
 import { LensManager, LensRunResult } from './lens-manager';
@@ -591,12 +593,20 @@ If you're in a lens channel (#wb-lens-*), read its history to understand what th
 
     try {
 
-      // Hydrate lens configs if present
+      // Hydrate lens configs with stem cell defaults
       if (parsed.plan?.lenses) {
         parsed.plan.lenses = parsed.plan.lenses.map((l: any) => ({
           ...l,
           state: 'active' as const,
           tools: l.tools || [],
+          permissions: {
+            tier: 'stem' as const,
+            allowed: [...STEM_CELL_ALLOWED],
+            denied: [...STEM_CELL_DENIED],
+            granted: [],
+            stableRunCount: 0,
+            observedTools: [],
+          },
           slackPersona: l.slackPersona || { username: l.name, icon_emoji: ':gear:' },
           inputContract: l.inputContract || { description: '', fields: {} },
           outputContract: l.outputContract || { description: '', fields: {} },

@@ -19,6 +19,43 @@ export interface ResearchPhase {
   maxDuration?: number; // seconds, default 120
 }
 
+export interface LensPermissions {
+  /** Lens maturity — determines permission behavior */
+  tier: 'stem' | 'shaping' | 'hardened';
+
+  /** Tools the lens is allowed to use. Empty = use sandbox defaults for tier. */
+  allowed: string[];
+
+  /** Tools explicitly denied regardless of tier. Hard limits. */
+  denied: string[];
+
+  /** Tools granted during shaping via Orchestrator or Pav elevation. */
+  granted: string[];
+
+  /** Number of consecutive runs with stable tool usage (for hardening trigger). */
+  stableRunCount: number;
+
+  /** Tool usage history — aggregated from events.jsonl across runs. */
+  observedTools: string[];
+}
+
+/** Hard sandbox limits for stem cell lenses — only Bash denied from birth. */
+export const STEM_CELL_DENIED: string[] = [
+  'Bash',         // no shell access until explicitly granted — too powerful
+];
+
+/** Default tools available to all stem cell lenses. Light guardrails. */
+export const STEM_CELL_ALLOWED: string[] = [
+  'Read',
+  'Glob',
+  'Grep',
+  'WebSearch',
+  'WebFetch',
+  'Write',        // workspace writes allowed from birth
+  'Edit',         // workspace edits allowed from birth
+  'Agent',
+];
+
 export interface LensConfig {
   id: string;
   name: string;
@@ -26,6 +63,7 @@ export interface LensConfig {
   systemPrompt: string;
   tools: string[];
   state: 'active' | 'dormant';
+  permissions: LensPermissions;
   slackPersona: SlackPersona;
   inputContract: ContractSpec;
   outputContract: ContractSpec;
@@ -39,7 +77,10 @@ export type WorkflowEventType =
   | 'state_change'
   | 'artifact'
   | 'error'
-  | 'summary';
+  | 'summary'
+  | 'elevation_request'
+  | 'elevation_granted'
+  | 'elevation_denied';
 
 export interface WorkflowEvent {
   id: string;

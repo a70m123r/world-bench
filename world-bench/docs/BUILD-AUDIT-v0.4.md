@@ -128,15 +128,61 @@ world-bench/
 
 ---
 
-## What v0.5 Needs (from spec + build learnings)
+## Council Code Review (2026-04-03 01:27–01:31)
 
-| Item | Source |
-|------|--------|
-| Lens-to-lens direct mesh | Spec: v0.5 |
-| Mid-run agent messaging | Spec: v0.5 |
-| `resume(id, newContext)` — restart lens from where it left off | Spec: v0.5 |
-| Auto-restart on failure | Spec: v0.5 |
-| Crash recovery — scan for orphaned runs on restart | Build discovery |
-| Concurrency > 1 (if Max rate limits allow) | Build discovery |
-| Windows scheduled task for true boot persistence | Build: needs admin elevation |
-| System prompt version tracking — detect code changes, don't carry stale session context | Build discovery |
+Pav shared the audit in `#room-zero`. Soren, Veil, and Claw independently reviewed against codebase + spec.
+
+**Verdict:** All three confirmed build is solid, audit is accurate.
+
+### Bugs Found (all fixed 2026-04-03 11:38)
+
+| # | Bug | Severity | Found by | Fix |
+|---|-----|----------|----------|-----|
+| 1 | `rewindOnFailure` dead code — `activeQueries.delete()` before result returned | HIGH | Soren + Claw | Capture reference before delete, null after use |
+| 2 | JSON response fragility — greedy regex `{[\s\S]*}` grabs wrong object | HIGH | All three | Bracket-matched parser with string/escape awareness + fence stripping |
+| 3 | Research timeout race — `kill(id)` fails if spawn hasn't resolved | MEDIUM | Veil + Claw | `getAbortController()` aborts directly, ghost agent cleanup after race |
+| 4 | Double-handler — `app_mention` + `message` both fire on `@` mentions | MEDIUM | Soren | `app_mention` handles all mentions, `message` handler home-channel only |
+| 5 | Bot token plaintext in `mcp-servers.json` | MEDIUM | Soren | `${SLACK_BOT_TOKEN}` env var reference, interpolated at load time |
+| 6 | Type leak — `_query`/`_lastUserMessageId` as `any` on AgentResult | LOW | Veil | New `ClaudeAgentResult` interface with typed `rewindContext` field |
+| 7 | Unused `orchestrator_channel_id` in ProjectMeta | LOW | Veil | Removed |
+| 8 | Stale empty `lenses/` and `src/` dirs | LOW | Veil | Removed. `research/` kept (30 pre-build docs). |
+
+### Additional Review Notes
+
+| Note | Source | Action |
+|------|--------|--------|
+| Event log centralization is better than spec | Soren + Veil | Spec should be updated to match reality |
+| `RunMeta` type drift — spec says `startedAt`, code says `started_at` | Soren | Spec should be updated |
+| `rewindOnFailure` untested under real failure conditions | Veil | Deliberate failure test needed before daily use |
+| Stale scaffold in `agents/rz-anthropic-og/world-bench/` | Soren | Should be deleted (old TODO-heavy skeleton) |
+| Veil flagged channel misrouting — investigated, bridge code is correct | Veil + Spinner | Split-brain issue (bridge + CLI, no shared state), not a session key bug |
+
+### Council Patterns Identified for v0.5 (from claw-code repo analysis)
+
+| Pattern | Source | Application |
+|---------|--------|-------------|
+| Hook pipeline (`PreToolUse`/`PostToolUse`) | claw-code `PARITY.md` | Lens supervision — Orchestrator intercepts tool calls before/after execution |
+| Permission/denial framework | claw-code tool registry | Per-lens tool scoping — research lens can't write files, joke lens can't bash |
+| Session persistence + resume | claw-code `storage.rs` | Maps to `resume(id, newContext)` for v0.5 |
+| Session compaction | claw-code runtime | Token budget management for long-running lenses |
+
+---
+
+## What v0.5 Needs (from spec + build learnings + council review + claw-code analysis)
+
+| Item | Source | Priority |
+|------|--------|----------|
+| Per-lens permission tiers (tool whitelist/blacklist) | Council + claw-code | High |
+| Structured output for command routing (replace JSON-in-prompt) | Soren (council review) | High |
+| `resume(id, newContext)` — restart lens from where it left off | Spec + claw-code | High |
+| Hook pipeline — Orchestrator supervises lens tool calls | claw-code + Pav pre-build | Medium |
+| Crash recovery — scan for orphaned runs on restart | Build discovery | Medium |
+| Deliberate failure test for `rewindOnFailure` | Veil (council review) | Medium |
+| Lens-to-lens direct mesh | Spec: v0.5 | Medium |
+| Mid-run agent messaging | Spec: v0.5 | Medium |
+| Auto-restart on failure | Spec: v0.5 | Low |
+| Session compaction for long-running lenses | claw-code | Low |
+| Concurrency > 1 (if Max rate limits allow) | Build discovery | Low |
+| Windows scheduled task for true boot persistence | Build: needs admin | Low |
+| System prompt version tracking — don't carry stale session context | Build discovery | Low |
+| Delete stale scaffold in `agents/rz-anthropic-og/world-bench/` | Soren (council review) | Low |

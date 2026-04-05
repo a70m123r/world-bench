@@ -194,8 +194,38 @@ export class ClaudeAgentAdapter implements AgentAdapter {
     const runId = context.run_id || '';
     const lensName = context.lens_name || 'unknown';
     const projectSlug = context.projectSlug || '';
+    const deniedTools: string[] = context.deniedTools || [];
 
     return {
+      // Permission enforcement — deny tools not in the lens's allowlist
+      PreToolUse: [{
+        hooks: [async (input: any) => {
+          const toolName = input.tool_name || '';
+
+          // Check if tool is explicitly denied
+          if (deniedTools.includes(toolName)) {
+            console.log(`[AgentAdapter] DENIED tool: ${toolName} for ${lensName}`);
+
+            if (runId && projectSlug) {
+              const event = createEvent(
+                runId, lensName, 'elevation_request',
+                `Lens "${lensName}" requested denied tool: ${toolName}`,
+                { tool: toolName, lens_name: lensName },
+              );
+              try { appendEvent(projectSlug, runId, event); } catch { }
+            }
+
+            return {
+              hookEventName: 'PreToolUse',
+              permissionDecision: 'deny',
+              additionalContext: `Tool "${toolName}" is not available. Work within your current toolset.`,
+            };
+          }
+
+          return { hookEventName: 'PreToolUse', permissionDecision: 'defer' };
+        }],
+      }],
+
       // Automatic event logging for every tool call
       PostToolUse: [{
         hooks: [async (input: any) => {

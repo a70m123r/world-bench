@@ -11,6 +11,7 @@ import {
   AgentResult,
   WorkflowEvent,
   RunMeta,
+  STEM_CELL_DENIED,
 } from '../agents/types';
 import { ClaudeAgentAdapter } from './agent-adapter';
 import {
@@ -19,6 +20,7 @@ import {
   buildProductionPrompt,
 } from '../agents/base-lens-agent';
 import { createEvent, appendEvent, setWorldBenchRoot } from './event-log';
+import { PermissionManager } from './permission-manager';
 
 const DEFAULT_RESEARCH_DURATION = 120; // seconds
 
@@ -32,10 +34,12 @@ export interface LensRunResult {
 export class LensManager {
   private adapter: ClaudeAgentAdapter;
   private worldBenchRoot: string;
+  private permissionManager: PermissionManager;
 
   constructor(adapter: ClaudeAgentAdapter, worldBenchRoot: string) {
     this.adapter = adapter;
     this.worldBenchRoot = worldBenchRoot;
+    this.permissionManager = new PermissionManager(worldBenchRoot);
     setWorldBenchRoot(worldBenchRoot);
   }
 
@@ -66,6 +70,10 @@ export class LensManager {
     );
     fs.mkdirSync(lensWorkspace, { recursive: true });
 
+    // Resolve effective tool permissions
+    const effectiveTools = this.permissionManager.getEffectiveTools(lens);
+    const deniedTools = [...(lens.permissions?.denied || STEM_CELL_DENIED)];
+
     const baseContext = {
       systemPrompt: buildLensSystemPrompt(lens),
       run_id: runId,
@@ -73,6 +81,7 @@ export class LensManager {
       purpose: lens.purpose,
       cwd: lensWorkspace,
       projectSlug,
+      deniedTools,
     };
 
     // ─── Research Phase ───
@@ -87,7 +96,7 @@ export class LensManager {
 
       researchResult = await this.spawnWithTimeout(
         researchPrompt,
-        lens.tools,
+        effectiveTools,
         baseContext,
         maxDuration,
       );
@@ -176,6 +185,21 @@ export class LensManager {
     allEvents.push(...productionResult.events);
     for (const e of productionResult.events) {
       appendEvent(projectSlug, runId, e);
+    }
+
+    // Track tool usage for permission hardening
+    if (productionResult.status === 'completed') {
+      const runTools = allEvents
+        .filter(e => e.actor === lens.name && e.type === 'message' && e.metadata?.tool)
+        .map(e => e.metadata!.tool as string);
+      const hardening = this.permissionManager.updateToolUsage(lens, projectSlug, runTools);
+      if (hardening.suggest) {
+        const hardenEvent = createEvent(runId, 'orchestrator', 'state_change',
+          hardening.message || 'Lens ready for hardening',
+          { lens_id: lens.id, phase: 'hardening_suggestion' });
+        allEvents.push(hardenEvent);
+        appendEvent(projectSlug, runId, hardenEvent);
+      }
     }
 
     // Emit completion event
