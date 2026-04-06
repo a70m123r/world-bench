@@ -37,6 +37,7 @@ export class Orchestrator {
   private contextProvider: ContextProvider | null = null;
   private sessions: Map<string, OrchestratorSession> = new Map();
   private mcpServers: Record<string, any> | null = null;
+  private availableMcpTools: string[] = [];
 
   constructor() {
     this.adapter = new ClaudeAgentAdapter();
@@ -58,16 +59,45 @@ export class Orchestrator {
     const mcpPath = path.join(WORLD_BENCH_ROOT, 'mcp-servers.json');
     try {
       if (fs.existsSync(mcpPath)) {
-        // Read and interpolate ${ENV_VAR} references with actual values
         let raw = fs.readFileSync(mcpPath, 'utf-8');
         raw = raw.replace(/\$\{(\w+)\}/g, (_, key) => process.env[key] || '');
         const config = JSON.parse(raw);
         this.mcpServers = config.mcpServers || null;
+
+        // Enumerate available MCP tool names from server source files
+        this.availableMcpTools = this.enumerateMcpTools();
         console.log(`[Orchestrator] MCP servers loaded: ${Object.keys(this.mcpServers || {}).join(', ')}`);
+        console.log(`[Orchestrator] MCP tools available: ${this.availableMcpTools.length}`);
       }
     } catch (e: any) {
       console.warn(`[Orchestrator] Failed to load MCP config: ${e.message}`);
     }
+  }
+
+  /**
+   * Enumerate canonical MCP tool names from known servers.
+   * Injected into system prompt so the Orchestrator doesn't hallucinate tool names.
+   */
+  private enumerateMcpTools(): string[] {
+    const tools: string[] = [];
+
+    // Slack MCP tools (from slack-mcp-server/src/index.ts)
+    const slackTools = [
+      'slack_read_channel', 'slack_read_thread', 'slack_read_dm',
+      'slack_post_message', 'slack_search', 'slack_list_channels',
+      'slack_react', 'slack_user_info', 'slack_create_canvas', 'slack_channel_info',
+    ];
+    for (const t of slackTools) tools.push(`mcp__slack__${t}`);
+
+    // Memory MCP tools (@modelcontextprotocol/server-memory)
+    const memoryTools = [
+      'create_entities', 'add_observations', 'create_relations',
+      'search_nodes', 'open_nodes', 'read_graph',
+      'delete_entities', 'delete_observations', 'delete_relations',
+    ];
+    for (const t of memoryTools) tools.push(`mcp__memory__${t}`);
+
+    return tools;
   }
 
   private loadSessionsFromDisk(): void {
@@ -515,6 +545,11 @@ You have a personal knowledge graph via the "memory" MCP server. Use it:
 - Before claiming you don't know something: search your memory first
 - Store things useful to your future self waking up cold
 Key tools: create_entities, add_observations, create_relations, search_nodes, open_nodes
+
+## Available MCP Tools (canonical names — use EXACTLY these, do not guess)
+${this.availableMcpTools.length > 0 ? this.availableMcpTools.map(t => `- \`${t}\``).join('\n') : '(none loaded)'}
+
+When speccing lenses that need MCP access, use these exact tool names in the tools array. Do NOT invent tool names — if a tool isn't in this list, it doesn't exist.
 
 ## Actions
 When you want to DO something (not just chat), use the Write tool to write a JSON action file to the workspace. This is how you express structured intent.
