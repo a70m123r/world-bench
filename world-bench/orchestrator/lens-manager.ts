@@ -36,12 +36,27 @@ export class LensManager {
   private adapter: ClaudeAgentAdapter;
   private worldBenchRoot: string;
   private permissionManager: PermissionManager;
+  private mcpServers: Record<string, any> | null = null;
 
   constructor(adapter: ClaudeAgentAdapter, worldBenchRoot: string) {
     this.adapter = adapter;
     this.worldBenchRoot = worldBenchRoot;
     this.permissionManager = new PermissionManager(worldBenchRoot);
-    setWorldBenchRoot(worldBenchRoot);
+    this.loadMcpConfig();
+  }
+
+  private loadMcpConfig(): void {
+    const mcpPath = path.join(this.worldBenchRoot, 'mcp-servers.json');
+    try {
+      if (fs.existsSync(mcpPath)) {
+        let raw = fs.readFileSync(mcpPath, 'utf-8');
+        // Interpolate env vars (same pattern as index.ts)
+        raw = raw.replace(/\$\{(\w+)\}/g, (_, key) => process.env[key] || '');
+        const config = JSON.parse(raw);
+        this.mcpServers = config.mcpServers || null;
+      }
+    } catch { }
+    setWorldBenchRoot(this.worldBenchRoot);
   }
 
   /**
@@ -87,7 +102,11 @@ export class LensManager {
       }
     } catch { }
 
-    const baseContext = {
+    // Check if lens needs MCP tools (any tool starting with 'mcp__')
+    const mcpToolNames = effectiveTools.filter(t => t.startsWith('mcp__'));
+    const needsMcp = mcpToolNames.length > 0;
+
+    const baseContext: Record<string, any> = {
       systemPrompt: buildLensSystemPrompt(lens),
       run_id: runId,
       lens_name: lens.name,
@@ -99,6 +118,12 @@ export class LensManager {
       permissionManager: this.permissionManager,
       lensConfig: lens,
     };
+
+    // Pass MCP servers to lens if it needs MCP tools
+    if (needsMcp && this.mcpServers) {
+      baseContext.mcpServers = this.mcpServers;
+      baseContext.mcpTools = mcpToolNames;
+    }
 
     // ─── Research Phase ───
     if (lens.researchPhase.enabled) {

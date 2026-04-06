@@ -1,35 +1,42 @@
-// World-Bench v0.6 — Context Provider (Situational Awareness v0.1)
+// Soren OG Bridge — Context Provider (Situational Awareness v0.1)
 // Four layers per council spec:
-//   1. Personal breadcrumbs (per-agent, bridge-mechanical)
+//   1. Personal breadcrumbs (bridge-mechanical, per-agent)
 //   2. Padded local slice (±3 around trigger, cap 20)
 //   3. Unified timeline (merged chronological, deduped from local slice)
 //   4. Mention inbox (search-based, file-backed)
 //
 // Principle: raw messages for the local scene, summaries for the wider map.
-// Shared sludge guardrail: personal layers are per-agent, never shared.
+// Shared sludge guardrail: personal layers are per-agent.
 
-import { WebClient } from '@slack/web-api';
+import { App } from '@slack/bolt';
+import { Logger } from './logger';
 import * as fs from 'fs';
 import * as path from 'path';
 
-const WORLD_BENCH_ROOT = process.env.WORLD_BENCH_ROOT || path.resolve(__dirname, '..');
-const COUNCIL_DIR = path.resolve(WORLD_BENCH_ROOT, '..', 'council');
-const BREADCRUMBS_PATH = path.join(COUNCIL_DIR, 'BREADCRUMBS.md');
+const ROOM_ZERO_CHANNEL = 'C0ALN8Q6QRE';
+const PAV_DM_CHANNEL = 'D0AKBPMJHFH';
+const ROOM_ORCHESTRATOR_CHANNEL = 'C0AQ6CZR0HM';
+const KITCHEN_CHANNEL = 'C0AM4JHCS58';
+const CONTEXT_FETCH_TIMEOUT_MS = 10000;
 
-// Hard caps per section (not percentages — council consensus)
+// Hard caps per section (council consensus)
 const LOCAL_SLICE_CAP = 20;
 const UNIFIED_TIMELINE_CAP = 70;
 const MENTIONS_CAP = 10;
-const BREADCRUMBS_CAP = 50;       // lines
+const BREADCRUMBS_CAP = 50;
 const COUNCIL_BREADCRUMBS_CHARS = 5000;
-const PER_CHANNEL_FLOOR = 5;      // minimum messages per watched channel in timeline
-const CONTEXT_TIMEOUT_MS = 10000;
+const PER_CHANNEL_FLOOR = 5;
 
-const ROOM_ZERO_CHANNEL = 'C0ALN8Q6QRE';
-const ROOM_ORCHESTRATOR_CHANNEL = 'C0AQ6CZR0HM';
-const KITCHEN_CHANNEL = 'C0AM4JHCS58';
+// Council files
+const COUNCIL_DIR = path.resolve(__dirname, '..', '..', 'council');
+const BREADCRUMBS_PATH = path.join(COUNCIL_DIR, 'BREADCRUMBS.md');
 
-interface SlackMessage {
+// Soren's memory
+const MEMORY_DIR = path.resolve(__dirname, '..', '..', 'memory');
+const BREADCRUMBS_FILE = path.join(MEMORY_DIR, 'soren-breadcrumbs.md');
+const MENTIONS_FILE = path.join(MEMORY_DIR, 'soren-mentions.json');
+
+interface ChannelMessage {
   timestamp: string;
   rawTs: string;
   username: string;
@@ -39,45 +46,56 @@ interface SlackMessage {
 }
 
 interface ChannelCache {
-  messages: SlackMessage[];
+  messages: ChannelMessage[];
   lastFetchTs: string;
 }
 
 interface MentionEntry {
-  message: SlackMessage;
+  message: ChannelMessage;
   status: 'new' | 'seen' | 'answered' | 'stale';
   channel: string;
   threadTs?: string;
 }
 
 export class ContextProvider {
-  private client: WebClient;
-  private orchestratorChannelId: string | null = null;
-  private botUserId: string | null = null;
+  private app: App;
+  private logger = new Logger('ContextProvider');
   private userCache: Map<string, string> = new Map();
   private channelCaches: Map<string, ChannelCache> = new Map();
   private mentionInbox: MentionEntry[] = [];
-  private mentionInboxPath: string;
-  private breadcrumbsPath: string;
+  private botUserId: string | null = null;
+  // Auto-growing watched channels — starts with known channels,
+  // grows when agent gets tagged in new ones (Soren's spec note)
+  private watchedChannels: Set<string> = new Set([
+    ROOM_ZERO_CHANNEL,
+    PAV_DM_CHANNEL,
+    ROOM_ORCHESTRATOR_CHANNEL,
+    KITCHEN_CHANNEL,
+  ]);
 
-  constructor(client: WebClient) {
-    this.client = client;
-    this.mentionInboxPath = path.join(WORLD_BENCH_ROOT, 'orchestrator', 'memory', 'orchestrator-mentions.json');
-    this.breadcrumbsPath = path.join(WORLD_BENCH_ROOT, 'orchestrator', 'memory', 'orchestrator-breadcrumbs.md');
+  constructor(app: App) {
+    this.app = app;
     this.loadMentionInbox();
-  }
-
-  setOrchestratorChannel(channelId: string): void {
-    this.orchestratorChannelId = channelId;
   }
 
   setBotUserId(userId: string): void {
     this.botUserId = userId;
   }
 
-  // ─── Main Entry Point ───
+  /**
+   * Auto-track a channel when the agent is tagged there.
+   * Grows the watched channels list so the unified timeline includes it.
+   */
+  trackChannel(channelId: string): void {
+    if (!this.watchedChannels.has(channelId)) {
+      this.watchedChannels.add(channelId);
+      this.logger.info(`Now watching channel: ${channelId}`);
+    }
+  }
 
-  async buildContext(
+  // ─── Main Entry Point (same interface as before) ───
+
+  async buildContextPreamble(
     currentChannel: string,
     currentThreadTs?: string,
     triggerTs?: string,
@@ -86,11 +104,11 @@ export class ContextProvider {
       return await Promise.race([
         this.assemblePacket(currentChannel, currentThreadTs, triggerTs),
         new Promise<string>((_, reject) =>
-          setTimeout(() => reject(new Error('Context fetch timeout')), CONTEXT_TIMEOUT_MS)
+          setTimeout(() => reject(new Error('Context fetch timeout')), CONTEXT_FETCH_TIMEOUT_MS)
         ),
       ]);
-    } catch (e: any) {
-      console.warn(`[ContextProvider] Context fetch failed: ${e.message}`);
+    } catch (error) {
+      this.logger.warn('Context fetch failed or timed out', error);
       return '';
     }
   }
@@ -111,7 +129,7 @@ export class ContextProvider {
       sections.push(`## Local Context (current conversation):\n${formatted}`);
     }
 
-    // 2. Unified timeline (all channels merged, excludes current channel)
+    // 2. Unified timeline (all watched channels, excludes current)
     const timeline = await this.buildUnifiedTimeline(currentChannel);
     if (timeline.length > 0) {
       const formatted = timeline.map(m =>
@@ -138,7 +156,7 @@ export class ContextProvider {
       sections.push(`## My Recent Activity:\n${breadcrumbs}`);
     }
 
-    // 5. Council breadcrumbs (shared — last 5000 chars)
+    // 5. Council breadcrumbs (shared)
     const councilBreadcrumbs = this.readFileTail(BREADCRUMBS_PATH, COUNCIL_BREADCRUMBS_CHARS);
     if (councilBreadcrumbs) {
       sections.push(`## Council Breadcrumbs:\n${councilBreadcrumbs}`);
@@ -159,29 +177,25 @@ export class ContextProvider {
     channel: string,
     threadTs?: string,
     triggerTs?: string,
-  ): Promise<SlackMessage[]> {
-    const messages: SlackMessage[] = [];
+  ): Promise<ChannelMessage[]> {
+    const messages: ChannelMessage[] = [];
 
     if (threadTs) {
-      // Thread reply: root + ±3 around trigger + latest reply + agent's last 3
       try {
-        const thread = await this.client.conversations.replies({
+        const thread = await this.app.client.conversations.replies({
           channel, ts: threadTs, limit: 100,
         });
         if (thread.ok && thread.messages) {
           const all = await this.resolveMessages(thread.messages, channel);
 
-          // Thread root
-          if (all.length > 0) messages.push(all[0]);
+          if (all.length > 0) messages.push(all[0]); // root
 
-          // Find trigger position
           const triggerIdx = triggerTs
             ? all.findIndex(m => m.rawTs === triggerTs)
             : all.length - 1;
 
           if (triggerIdx > 0) {
-            // ±3 around trigger
-            const start = Math.max(1, triggerIdx - 3); // skip root (already added)
+            const start = Math.max(1, triggerIdx - 3);
             const end = Math.min(all.length, triggerIdx + 4);
             for (let i = start; i < end; i++) {
               if (!messages.find(m => m.rawTs === all[i].rawTs)) {
@@ -190,27 +204,16 @@ export class ContextProvider {
             }
           }
 
-          // Latest reply (if not already included)
           const latest = all[all.length - 1];
           if (!messages.find(m => m.rawTs === latest.rawTs)) {
             messages.push(latest);
           }
-
-          // Agent's last 3 in this thread
-          if (this.botUserId) {
-            const myMsgs = all.filter(m => m.username === 'Orchestrator' || m.rawTs === triggerTs);
-            for (const m of myMsgs.slice(-3)) {
-              if (!messages.find(x => x.rawTs === m.rawTs)) {
-                messages.push(m);
-              }
-            }
-          }
         }
       } catch { }
 
-      // 1 channel message before thread root for context
+      // 1 channel message before thread root
       try {
-        const before = await this.client.conversations.history({
+        const before = await this.app.client.conversations.history({
           channel, latest: threadTs, limit: 2, inclusive: false,
         });
         if (before.ok && before.messages && before.messages.length > 0) {
@@ -220,14 +223,12 @@ export class ContextProvider {
       } catch { }
 
     } else {
-      // Top-level channel message: ±3 around trigger + agent's last 3
       try {
-        const history = await this.client.conversations.history({
+        const history = await this.app.client.conversations.history({
           channel, limit: 20,
         });
         if (history.ok && history.messages) {
           const all = await this.resolveMessages(history.messages.reverse(), channel);
-
           const triggerIdx = triggerTs
             ? all.findIndex(m => m.rawTs === triggerTs)
             : all.length - 1;
@@ -239,77 +240,50 @@ export class ContextProvider {
               messages.push(all[i]);
             }
           } else {
-            // Trigger not found — take last 7
             messages.push(...all.slice(-7));
-          }
-
-          // Agent's last 3 in this channel (protect from budget squeeze — Veil's note)
-          const myMsgs = all.filter(m => m.username === 'Orchestrator');
-          for (const m of myMsgs.slice(-3)) {
-            if (!messages.find(x => x.rawTs === m.rawTs)) {
-              messages.push(m);
-            }
           }
         }
       } catch { }
     }
 
-    // Sort chronologically and cap
     messages.sort((a, b) => parseFloat(a.rawTs) - parseFloat(b.rawTs));
     return messages.slice(-LOCAL_SLICE_CAP);
   }
 
   // ─── 2. Unified Timeline ───
 
-  private async buildUnifiedTimeline(excludeChannel: string): Promise<SlackMessage[]> {
-    // Watched channels (excluding the current one — local slice owns it)
-    const channels = [ROOM_ZERO_CHANNEL, ROOM_ORCHESTRATOR_CHANNEL, KITCHEN_CHANNEL];
-    if (this.orchestratorChannelId && !channels.includes(this.orchestratorChannelId)) {
-      channels.push(this.orchestratorChannelId);
-    }
-    // Remove duplicates and exclude current channel
-    const watchedChannels = [...new Set(channels)].filter(c => c !== excludeChannel);
+  private async buildUnifiedTimeline(excludeChannel: string): Promise<ChannelMessage[]> {
+    const channels = [...this.watchedChannels]
+      .filter(c => c !== excludeChannel);
 
-    const allMessages: SlackMessage[] = [];
+    const allMessages: ChannelMessage[] = [];
 
-    for (const channel of watchedChannels) {
+    for (const channel of channels) {
       const msgs = await this.getChannelMessages(channel, Math.max(PER_CHANNEL_FLOOR, 30));
-      // Tag each message with its channel name
-      for (const m of msgs) {
-        m.channel = channel === ROOM_ZERO_CHANNEL ? 'room-zero'
-          : channel === ROOM_ORCHESTRATOR_CHANNEL ? 'room-orchestrator'
-          : channel === KITCHEN_CHANNEL ? 'kitchen'
-          : channel === this.orchestratorChannelId ? 'wb-orchestrator'
-          : channel;
-      }
+      const chName = channel === ROOM_ZERO_CHANNEL ? 'room-zero'
+        : channel === PAV_DM_CHANNEL ? 'pav-dm'
+        : channel === ROOM_ORCHESTRATOR_CHANNEL ? 'room-orchestrator'
+        : channel === KITCHEN_CHANNEL ? 'kitchen'
+        : channel;
+      for (const m of msgs) { m.channel = chName; }
       allMessages.push(...msgs);
     }
 
-    // Sort chronologically, cap
     allMessages.sort((a, b) => parseFloat(a.rawTs) - parseFloat(b.rawTs));
 
-    // Ensure per-channel floor
-    const result: SlackMessage[] = [];
-    const perChannel = new Map<string, number>();
-
-    // First pass: guarantee floor per channel
-    for (const ch of watchedChannels) {
+    // Per-channel floor
+    const result: ChannelMessage[] = [];
+    for (const ch of channels) {
       const chName = ch === ROOM_ZERO_CHANNEL ? 'room-zero'
-        : ch === ROOM_ORCHESTRATOR_CHANNEL ? 'room-orchestrator'
-        : ch === KITCHEN_CHANNEL ? 'kitchen'
-        : ch === this.orchestratorChannelId ? 'wb-orchestrator' : ch;
+        : ch === PAV_DM_CHANNEL ? 'pav-dm' : ch;
       const chMsgs = allMessages.filter(m => m.channel === chName).slice(-PER_CHANNEL_FLOOR);
       result.push(...chMsgs);
-      perChannel.set(chName, chMsgs.length);
     }
 
-    // Second pass: fill remaining slots chronologically
     const remaining = UNIFIED_TIMELINE_CAP - result.length;
     if (remaining > 0) {
       const alreadyAdded = new Set(result.map(m => m.rawTs));
-      const extras = allMessages
-        .filter(m => !alreadyAdded.has(m.rawTs))
-        .slice(-remaining);
+      const extras = allMessages.filter(m => !alreadyAdded.has(m.rawTs)).slice(-remaining);
       result.push(...extras);
     }
 
@@ -322,8 +296,9 @@ export class ContextProvider {
   private async refreshMentionInbox(): Promise<void> {
     if (!this.botUserId) return;
 
-    // search.messages requires user token (xoxp-), not bot token (xoxb-).
-    // Scan cached channel messages for @mentions instead.
+    // search.messages requires a user token (xoxp-), not bot token (xoxb-).
+    // Bot tokens get auth errors. Instead, scan cached channel messages
+    // for @mentions of this agent.
     try {
       const mentionPattern = `<@${this.botUserId}>`;
       const lastChecked = this.mentionInbox.length > 0
@@ -345,6 +320,7 @@ export class ContextProvider {
         }
       }
 
+      // Cap and expire
       if (this.mentionInbox.length > 100) {
         this.mentionInbox = this.mentionInbox.slice(-100);
       }
@@ -358,17 +334,13 @@ export class ContextProvider {
 
       this.saveMentionInbox();
     } catch (e: any) {
-      console.warn(`[ContextProvider] Mention scan failed: ${e.message}`);
+      this.logger.warn('Mention scan failed', { error: e.message });
     }
   }
 
-  /**
-   * Mark mentions as answered when the Orchestrator replies in that channel/thread.
-   */
   markMentionAnswered(channel: string, threadTs?: string): void {
     for (const entry of this.mentionInbox) {
       if (entry.status === 'new' || entry.status === 'seen') {
-        // Only mark answered if reply is in the same thread/channel (Claw's note)
         if (threadTs && entry.threadTs === threadTs) {
           entry.status = 'answered';
         } else if (!threadTs && entry.channel === channel && !entry.threadTs) {
@@ -381,27 +353,23 @@ export class ContextProvider {
 
   private loadMentionInbox(): void {
     try {
-      if (fs.existsSync(this.mentionInboxPath)) {
-        this.mentionInbox = JSON.parse(fs.readFileSync(this.mentionInboxPath, 'utf-8'));
+      if (fs.existsSync(MENTIONS_FILE)) {
+        this.mentionInbox = JSON.parse(fs.readFileSync(MENTIONS_FILE, 'utf-8'));
       }
     } catch { }
   }
 
   private saveMentionInbox(): void {
     try {
-      fs.mkdirSync(path.dirname(this.mentionInboxPath), { recursive: true });
-      fs.writeFileSync(this.mentionInboxPath, JSON.stringify(this.mentionInbox, null, 2));
+      fs.mkdirSync(path.dirname(MENTIONS_FILE), { recursive: true });
+      fs.writeFileSync(MENTIONS_FILE, JSON.stringify(this.mentionInbox, null, 2));
     } catch (e: any) {
-      console.error(`[ContextProvider] Failed to save mention inbox: ${e.message}`);
+      this.logger.warn('Failed to save mention inbox', { error: e.message });
     }
   }
 
   // ─── 4. Personal Breadcrumbs ───
 
-  /**
-   * Append a breadcrumb entry. Called by the bridge after each response.
-   * Bridge writes the mechanical skeleton — no agent narration needed.
-   */
   appendBreadcrumb(
     channel: string,
     threadTs: string | undefined,
@@ -415,35 +383,33 @@ export class ContextProvider {
     const line = `[${ts}] #${channel}${threadTag} | from: ${triggerUser} | ${responseLength} chars${toolsTag}\n`;
 
     try {
-      fs.mkdirSync(path.dirname(this.breadcrumbsPath), { recursive: true });
-      fs.appendFileSync(this.breadcrumbsPath, line);
+      fs.mkdirSync(path.dirname(BREADCRUMBS_FILE), { recursive: true });
+      fs.appendFileSync(BREADCRUMBS_FILE, line);
 
-      // Rolling window — trim to last 100 lines
-      const content = fs.readFileSync(this.breadcrumbsPath, 'utf-8');
+      const content = fs.readFileSync(BREADCRUMBS_FILE, 'utf-8');
       const lines = content.trim().split('\n');
       if (lines.length > 100) {
-        fs.writeFileSync(this.breadcrumbsPath, lines.slice(-100).join('\n') + '\n');
+        fs.writeFileSync(BREADCRUMBS_FILE, lines.slice(-100).join('\n') + '\n');
       }
     } catch (e: any) {
-      console.error(`[ContextProvider] Failed to write breadcrumb: ${e.message}`);
+      this.logger.warn('Failed to write breadcrumb', { error: e.message });
     }
   }
 
   private readPersonalBreadcrumbs(): string | null {
     try {
-      if (!fs.existsSync(this.breadcrumbsPath)) return null;
-      const content = fs.readFileSync(this.breadcrumbsPath, 'utf-8').trim();
+      if (!fs.existsSync(BREADCRUMBS_FILE)) return null;
+      const content = fs.readFileSync(BREADCRUMBS_FILE, 'utf-8').trim();
       if (!content) return null;
-      const lines = content.split('\n');
-      return lines.slice(-BREADCRUMBS_CAP).join('\n');
+      return content.split('\n').slice(-BREADCRUMBS_CAP).join('\n');
     } catch {
       return null;
     }
   }
 
-  // ─── Channel Cache (incremental fetch) ───
+  // ─── Channel Cache ───
 
-  private async getChannelMessages(channel: string, limit: number): Promise<SlackMessage[]> {
+  private async getChannelMessages(channel: string, limit: number): Promise<ChannelMessage[]> {
     const cache = this.channelCaches.get(channel);
 
     if (!cache) {
@@ -455,12 +421,9 @@ export class ContextProvider {
       return messages;
     }
 
-    // Incremental fetch
     try {
-      const response = await this.client.conversations.history({
-        channel,
-        oldest: cache.lastFetchTs,
-        limit: 50,
+      const response = await this.app.client.conversations.history({
+        channel, oldest: cache.lastFetchTs, limit: 50,
       });
 
       if (response.ok && response.messages && response.messages.length > 0) {
@@ -475,7 +438,7 @@ export class ContextProvider {
         }
       }
     } catch (e: any) {
-      console.warn(`[ContextProvider] Incremental fetch failed for ${channel}: ${e.message}`);
+      this.logger.warn(`Incremental fetch failed for ${channel}`, { error: e.message });
     }
 
     return cache.messages.slice(-limit);
@@ -483,8 +446,8 @@ export class ContextProvider {
 
   // ─── Raw Fetchers ───
 
-  private async fetchHistory(channel: string, limit: number): Promise<SlackMessage[]> {
-    const response = await this.client.conversations.history({ channel, limit });
+  private async fetchHistory(channel: string, limit: number): Promise<ChannelMessage[]> {
+    const response = await this.app.client.conversations.history({ channel, limit });
     if (!response.ok || !response.messages) return [];
     return this.resolveMessages(response.messages.reverse(), channel);
   }
@@ -492,8 +455,8 @@ export class ContextProvider {
   private async resolveMessages(
     messages: Array<{ user?: string; text?: string; ts?: string; bot_id?: string; username?: string; thread_ts?: string }>,
     channel?: string,
-  ): Promise<SlackMessage[]> {
-    const resolved: SlackMessage[] = [];
+  ): Promise<ChannelMessage[]> {
+    const resolved: ChannelMessage[] = [];
 
     for (const msg of messages) {
       if (!msg.ts || !msg.text) continue;
@@ -528,15 +491,16 @@ export class ContextProvider {
     if (cached) return cached;
 
     try {
-      const response = await this.client.users.info({ user: userId });
-      const name =
+      const response = await this.app.client.users.info({ user: userId });
+      const displayName =
         (response.user as any)?.profile?.display_name ||
         (response.user as any)?.real_name ||
         (response.user as any)?.name ||
         userId;
-      this.userCache.set(userId, name);
-      return name;
-    } catch {
+      this.userCache.set(userId, displayName);
+      return displayName;
+    } catch (error) {
+      this.logger.warn('Failed to resolve username', { userId, error });
       this.userCache.set(userId, userId);
       return userId;
     }

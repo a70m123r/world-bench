@@ -73,6 +73,19 @@ export class ClaudeAgentAdapter implements AgentAdapter {
         options.allowedTools = tools;
       }
 
+      // Pass MCP servers to lens if provided in context.
+      // This lets the Orchestrator spec lenses with Slack MCP, Memory MCP, etc.
+      if (context.mcpServers) {
+        options.mcpServers = context.mcpServers;
+        // Add MCP tool names to allowed tools
+        if (context.mcpTools && Array.isArray(context.mcpTools)) {
+          options.allowedTools = [
+            ...(options.allowedTools || []),
+            ...context.mcpTools,
+          ];
+        }
+      }
+
       const messages: string[] = [];
       const q = query({ prompt: fullPrompt, options });
 
