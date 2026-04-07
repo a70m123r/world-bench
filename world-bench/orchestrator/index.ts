@@ -643,6 +643,26 @@ export class Orchestrator {
         }
       }
 
+      // amend_seed: update an existing draft seed in place. Routes through
+      // SeedManager.updateSeed() which strips lifecycle-protected fields. v0.6.3:
+      // this is the legitimate path for amending a draft. Direct file write is
+      // now denied at the canUseTool layer, so this is the only way to evolve a
+      // seed before ignition.
+      if ((response.action as string) === 'amend_seed' && response.plan) {
+        try {
+          const { slug, ...updates } = response.plan;
+          if (!slug) throw new Error('amend_seed requires a slug');
+          // Drop the action field — it shouldn't be persisted as a seed property
+          delete (updates as any).action;
+          const seed = this.seedManager.updateSeed(slug, updates);
+          await this.terminal.postToChannel(replyTo,
+            `:pencil2: Seed amended: \`${seed.slug}\` (status: \`${seed.status}\`). Lifecycle fields are protected — only the editable fields were changed.`,
+          );
+        } catch (e: any) {
+          await this.terminal.postToChannel(replyTo, `Could not amend seed: ${e.message}`);
+        }
+      }
+
       // ignite_seed: promote draft to ignited. Pav interlock enforced in seedManager.
       if (response.action === 'ignite_seed' && response.plan) {
         try {
@@ -786,9 +806,91 @@ export class Orchestrator {
    * Conversational handler — talk to Pav like a person.
    * v0.6: Adds seed lifecycle actions and the four-phase positive pattern.
    */
+  /**
+   * v0.6.3: capability boundary for file-mutation tools.
+   *
+   * Returns a `canUseTool` callback that the SDK calls before every tool execution.
+   * Allows everything by default; explicitly DENIES Write/Edit/NotebookEdit on any
+   * path the Orchestrator has no business mutating directly.
+   *
+   * The protected surfaces:
+   *   - projects/* SEED.md, project.json, lenses/* lens.json
+   *     → owned by SeedManager / LensManager. Mutation MUST go through APIs.
+   *   - orchestrator/index.ts, seed-manager.ts, etc.
+   *     → source code. The Orchestrator does not edit its own source. That's Spinner's job.
+   *
+   * The single allowed write target:
+   *   - orchestrator/action.json
+   *     → the dispatch surface. The Orchestrator writes here to express intent.
+   *
+   * Council direction (v0.6.3 escalation thread):
+   *   "If a file is the source of truth, but the model can also rewrite it freely,
+   *    then the file is not protected state — it is just editable theater." (Claw)
+   *   "The interlock is a lock on the front door while the agent has the keys to
+   *    the back." (Veil)
+   *   "The spec is correct; the enforcement surface is wrong." (Soren)
+   */
+  private makeCanUseTool() {
+    const root = WORLD_BENCH_ROOT;
+    const allowedActionPath = path.resolve(root, 'orchestrator', 'action.json');
+    const isProtectedPath = (p: string): boolean => {
+      const abs = path.resolve(p);
+      // Anything inside projects/* is protected — owned by SeedManager / LensManager
+      if (abs.startsWith(path.resolve(root, 'projects'))) return true;
+      // The orchestrator's own source — not Pav-approved territory for the model
+      if (abs.startsWith(path.resolve(root, 'orchestrator')) && abs !== allowedActionPath) {
+        // ...but action.json is the one allowed write target inside orchestrator/
+        return true;
+      }
+      // The agents directory (types, base lens, stem cell config) — Spinner's
+      if (abs.startsWith(path.resolve(root, 'agents'))) return true;
+      return false;
+    };
+
+    return async (toolName: string, input: Record<string, unknown>, _options: any): Promise<any> => {
+      // Only the file-mutation tools are gated. Everything else passes.
+      const mutationTools = new Set(['Write', 'Edit', 'NotebookEdit', 'MultiEdit']);
+      if (!mutationTools.has(toolName)) {
+        return { behavior: 'allow', updatedInput: input };
+      }
+
+      // Extract the file_path / notebook_path argument
+      const targetPath = (input.file_path || input.notebook_path || input.path) as string | undefined;
+      if (!targetPath) {
+        // Defensive: if we can't determine the path, deny rather than allow
+        return {
+          behavior: 'deny',
+          message: `${toolName} called without a file_path. Refusing for safety. If you need to express intent, write to orchestrator/action.json instead.`,
+        };
+      }
+
+      const absTarget = path.resolve(root, targetPath);
+
+      // The one allowed write target
+      if (absTarget === allowedActionPath) {
+        return { behavior: 'allow', updatedInput: input };
+      }
+
+      // All protected paths are denied
+      if (isProtectedPath(absTarget)) {
+        const reason = absTarget.startsWith(path.resolve(root, 'projects'))
+          ? `${absTarget} is owned by SeedManager / LensManager. Mutating it directly bypasses the v0.6 lifecycle interlock. Use an action verb instead: create_seed, ignite_seed, amend_seed, propose_lens, render_lens, rehearse.`
+          : `${absTarget} is outside your write scope. The Orchestrator's only allowed file-write target is orchestrator/action.json. To mutate seeds, use action verbs. To mutate source, ask Spinner.`;
+        console.warn(`[canUseTool] DENIED: ${toolName} on ${absTarget}`);
+        return {
+          behavior: 'deny',
+          message: `Direct file mutation denied. ${reason}`,
+        };
+      }
+
+      // Anything else (e.g. user-named scratch paths outside protected areas) is allowed.
+      return { behavior: 'allow', updatedInput: input };
+    };
+  }
+
   private async converse(cmd: OrchestratorCommand, currentTurnId: string): Promise<{
     reply: string;
-    action: 'chat' | 'create_project' | 'status' | 'create_seed' | 'ignite_seed' | 'propose_lens' | 'render_lens' | 'rehearse' | 'resume_lens';
+    action: 'chat' | 'create_project' | 'status' | 'create_seed' | 'amend_seed' | 'ignite_seed' | 'propose_lens' | 'render_lens' | 'rehearse' | 'resume_lens';
     plan?: any;
   }> {
     const { query: sdkQuery } = require('@anthropic-ai/claude-agent-sdk');
@@ -847,11 +949,31 @@ ${hasActiveWork
 ## Anti-Drift Clause
 
 Your response is **WRONG** if it contains:
-- More than one new lens definition in a single turn
+- More than one *full* lens definition (with tools/systemPrompt/contracts) in a single turn
 - Tool lists or contracts for lenses that don't exist yet
-- A "full pipeline" or "end-to-end plan" with multiple stages pre-specified
+- A "full pipeline" with rendered lenses across multiple stages pre-specified
 - Priorities sourced from state files instead of Pav's direct instruction
 - Same-turn \`create_seed\` followed by \`ignite_seed\` (mechanically blocked anyway, but don't try)
+- *Direct file mutation of any project lifecycle file* (see "The Capability Boundary" below)
+
+Your sketch *may* contain multiple advisory entries that describe the shape you see in Pav's intent — e.g. "harvester → extractor → renderer." Sketch entries are hypotheses about the problem shape, not commitments. Only \`render_lens\` is committing. If you see a multi-step shape in the problem, sketch it.
+
+## The Capability Boundary (v0.6.3 — read this carefully)
+
+**The v0.6 lifecycle interlock was bypassed in production on its first real use.** You wrote SEED.md directly via the \`Write\` tool, hand-typed an \`ignited_at\` timestamp, invented a fake turn UUID, and posted ":sparkler: ignited" — all without calling \`SeedManager.igniteSeed()\`. The interlock check never ran. The council diagnosed this as an *enforcement surface* failure: the spec was right, but you held write authority over the very files the spec was supposed to protect.
+
+**v0.6.3 closes the gap.** A \`canUseTool\` callback now runs before every \`Write\`/\`Edit\`/\`NotebookEdit\`/\`MultiEdit\`. It DENIES any write that targets:
+- \`projects/*/SEED.md\` — owned by SeedManager
+- \`projects/*/project.json\` — owned by the bootstrap code
+- \`projects/*/lenses/*/lens.json\` — owned by LensManager
+- \`orchestrator/*\` (except \`action.json\`) — your own source code
+- \`agents/*\` — type definitions and stem cell config
+
+**Your only allowed write target is \`orchestrator/action.json\`.** Everything else mutates the world through action verbs (\`create_seed\`, \`amend_seed\`, \`ignite_seed\`, \`propose_lens\`, \`render_lens\`, \`rehearse\`), MCP tool calls (Memory, Slack), or Slack messages.
+
+**The rule is not advisory.** If you try to \`Write\` a protected path, the SDK will deny it before the tool runs and you'll see the deny message in your tool result. Do not interpret a deny as "I should try a different write path." Interpret it as: *the action you wanted to take has a verb. Use the verb.*
+
+The deeper rule, in the council's words: *"if a file is the source of truth, but the model can also rewrite it freely, then the file is not protected state — it is just editable theater."* Don't make protected state into theater.
 
 ## The Ecosystem
 
@@ -889,7 +1011,28 @@ When you want to DO something, write a file to \`${WORLD_BENCH_ROOT}/orchestrato
 }
 \`\`\`
 
-**\`ignite_seed\`** — promote draft to ignited. Pav must have approved in a previous turn (mechanically enforced).
+**\`amend_seed\`** — update an existing draft seed in place. Use this to evolve a sketch, fold answers into the seed, add constraints, or specify the artifact_spec. Routes through SeedManager which protects lifecycle fields (status, created_at_turn_id, ignited_at, ignited_at_turn_id) from mutation. **You may NOT amend a seed by writing SEED.md directly — that path is denied at the capability boundary. Use this verb.**
+\`\`\`json
+{
+  "action": "amend_seed",
+  "slug": "project-slug",
+  "intent": "(optional) updated intent",
+  "output_shape": "(optional) updated output shape",
+  "lens_sketch": [ /* optional updated sketch */ ],
+  "constraints": {
+    "product": ["v1 is one hat, not a hat system"],
+    "process": ["shape-cutting is manual until v0.7"]
+  },
+  "artifact_spec": {
+    "path": "world-bench/hats/orchestrator/hat.md",
+    "format": "markdown",
+    "sections": ["Active Seeds", "Recent Decisions", "Pav's Latest Direction", "Blocked Items"],
+    "word_cap": 500
+  }
+}
+\`\`\`
+
+**\`ignite_seed\`** — promote draft to ignited. Pav must have approved in a previous turn (mechanically enforced). **You may NOT mark a seed as ignited by writing SEED.md directly — that path is denied. Use this verb.**
 \`\`\`json
 { "action": "ignite_seed", "slug": "project-slug" }
 \`\`\`
@@ -956,11 +1099,21 @@ If you're in a lens channel (#wb-lens-*), read its history. If you're in a proje
 
     const options: any = {
       outputFormat: 'stream-json',
-      permissionMode: 'bypassPermissions',
+      // v0.6.3: NOT bypassPermissions. We need canUseTool to fire on every Write/Edit
+      // so the protected-path deny rules can run. 'default' is the right mode here —
+      // canUseTool is the gatekeeper, not the user.
+      permissionMode: 'default',
       model: 'claude-opus-4-6',
       systemPrompt,
       // No maxTurns — match Veil/Soren pattern. SDK runs until done.
       cwd: WORLD_BENCH_ROOT,
+      // v0.6.3: canUseTool — the capability boundary that v0.6 was missing.
+      // The v0.6 Pav interlock enforced ignition rules in SeedManager API but the
+      // model still held Write/Edit over the same files those APIs guarded. Result:
+      // first real ignition was bypassed by direct file write. Now: any write to a
+      // protected path is denied at the SDK level, before the tool runs. The interlock
+      // becomes a real boundary, not a library guarantee.
+      canUseTool: this.makeCanUseTool(),
     };
 
     // Resume existing session for conversation continuity
@@ -1050,7 +1203,7 @@ If you're in a lens channel (#wb-lens-*), read its history. If you're in a proje
 
     // Check if the Orchestrator wrote an action file
     const actionPath = path.join(WORLD_BENCH_ROOT, 'orchestrator', 'action.json');
-    type ActionType = 'chat' | 'create_project' | 'status' | 'create_seed' | 'ignite_seed' | 'propose_lens' | 'render_lens' | 'rehearse' | 'resume_lens';
+    type ActionType = 'chat' | 'create_project' | 'status' | 'create_seed' | 'amend_seed' | 'ignite_seed' | 'propose_lens' | 'render_lens' | 'rehearse' | 'resume_lens';
     let action: ActionType = 'chat';
     let plan: any = undefined;
 
@@ -1062,6 +1215,11 @@ If you're in a lens channel (#wb-lens-*), read its history. If you're in a proje
         // v0.6 seed lifecycle actions
         if (actionData.action === 'create_seed' && actionData.slug) {
           action = 'create_seed';
+          plan = actionData;
+        } else if (actionData.action === 'amend_seed' && actionData.slug) {
+          // v0.6.3: legitimate path for amending a draft seed in place.
+          // Goes through SeedManager.updateSeed() which protects lifecycle fields.
+          action = 'amend_seed';
           plan = actionData;
         } else if (actionData.action === 'ignite_seed' && actionData.slug) {
           action = 'ignite_seed';

@@ -279,6 +279,227 @@ async function main() {
     fail(`rehearse source check failed: ${e.message}`); failed++;
   }
 
+  // ─── TEST 11: v0.6.3 — capability boundary canUseTool present ───
+  console.log('\nTEST 11: canUseTool — capability boundary on protected paths (v0.6.3)');
+  try {
+    const indexSource = fs.readFileSync(path.join(WORLD_BENCH_ROOT, 'orchestrator', 'index.ts'), 'utf-8');
+
+    // makeCanUseTool helper exists
+    if (/private makeCanUseTool\(\)/.test(indexSource)) {
+      pass('makeCanUseTool() helper present'); passed++;
+    } else {
+      fail('makeCanUseTool() helper missing'); failed++;
+    }
+
+    // canUseTool wired into SDK options
+    if (/canUseTool: this\.makeCanUseTool\(\)/.test(indexSource)) {
+      pass('canUseTool wired into SDK options'); passed++;
+    } else {
+      fail('canUseTool not wired into SDK options'); failed++;
+    }
+
+    // permissionMode is NOT bypassPermissions anymore (would short-circuit canUseTool)
+    const sdkBlock = indexSource.match(/permissionMode:\s*'([^']+)'/);
+    if (sdkBlock && sdkBlock[1] !== 'bypassPermissions') {
+      pass(`permissionMode is '${sdkBlock[1]}' (not bypassPermissions, so canUseTool fires)`); passed++;
+    } else {
+      fail('permissionMode is still bypassPermissions — canUseTool will be skipped'); failed++;
+    }
+
+    // Mutation tools list includes Write/Edit/NotebookEdit/MultiEdit
+    if (/mutationTools = new Set\(\[['"]Write['"][^)]*['"]Edit['"][^)]*['"]NotebookEdit['"][^)]*['"]MultiEdit['"]/.test(indexSource)) {
+      pass('mutation tools set covers Write, Edit, NotebookEdit, MultiEdit'); passed++;
+    } else {
+      fail('mutation tools set is incomplete'); failed++;
+    }
+
+    // Protected path detector covers projects/, orchestrator/, agents/
+    const cu = indexSource.indexOf('makeCanUseTool');
+    const cuEnd = indexSource.indexOf('private async converse', cu);
+    const cuBody = indexSource.slice(cu, cuEnd);
+    if (/'projects'/.test(cuBody) && /'orchestrator'/.test(cuBody) && /'agents'/.test(cuBody)) {
+      pass('protected path detector covers projects/, orchestrator/, agents/'); passed++;
+    } else {
+      fail('protected path detector incomplete'); failed++;
+    }
+
+    // action.json is the explicit allowlist
+    if (/allowedActionPath/.test(cuBody) && /action\.json/.test(cuBody)) {
+      pass('action.json is the explicit single allowed write target'); passed++;
+    } else {
+      fail('action.json allowlist missing'); failed++;
+    }
+
+    // Deny returns a behavior:'deny' result
+    if (/behavior:\s*['"]deny['"]/.test(cuBody)) {
+      pass('canUseTool returns deny result on protected paths'); passed++;
+    } else {
+      fail('canUseTool deny path missing'); failed++;
+    }
+  } catch (e: any) {
+    fail(`canUseTool check failed: ${e.message}`); failed++;
+  }
+
+  // ─── TEST 12: v0.6.3 — amend_seed action verb ───
+  console.log('\nTEST 12: amend_seed verb — legitimate path through SeedManager (v0.6.3)');
+  try {
+    const indexSource = fs.readFileSync(path.join(WORLD_BENCH_ROOT, 'orchestrator', 'index.ts'), 'utf-8');
+
+    // ActionType union includes amend_seed
+    if (/'amend_seed'/.test(indexSource)) {
+      pass('amend_seed in ActionType union'); passed++;
+    } else {
+      fail('amend_seed missing from ActionType union'); failed++;
+    }
+
+    // Action handler wired
+    if (/\(response\.action as string\) === 'amend_seed'/.test(indexSource)) {
+      pass('amend_seed action handler present'); passed++;
+    } else {
+      fail('amend_seed action handler missing'); failed++;
+    }
+
+    // Parser branch wired
+    if (/actionData\.action === 'amend_seed'/.test(indexSource)) {
+      pass('amend_seed parser branch present'); passed++;
+    } else {
+      fail('amend_seed parser branch missing'); failed++;
+    }
+
+    // Routes through SeedManager.updateSeed (not direct write)
+    const handlerStart = indexSource.indexOf("(response.action as string) === 'amend_seed'");
+    const handlerEnd = indexSource.indexOf('// ignite_seed:', handlerStart);
+    const handlerBody = indexSource.slice(handlerStart, handlerEnd);
+    if (/this\.seedManager\.updateSeed\(/.test(handlerBody)) {
+      pass('amend_seed handler routes through SeedManager.updateSeed()'); passed++;
+    } else {
+      fail('amend_seed handler does not call SeedManager.updateSeed()'); failed++;
+    }
+  } catch (e: any) {
+    fail(`amend_seed check failed: ${e.message}`); failed++;
+  }
+
+  // ─── TEST 13: v0.6.3 — ProjectSeed grew constraints + artifact_spec ───
+  console.log('\nTEST 13: ProjectSeed type — constraints + artifact_spec fields (v0.6.3)');
+  try {
+    const typesSource = fs.readFileSync(path.join(WORLD_BENCH_ROOT, 'agents', 'types.ts'), 'utf-8');
+    const seedStart = typesSource.indexOf('export interface ProjectSeed');
+    const seedEnd = typesSource.indexOf('export interface LensSketch', seedStart);
+    const seedBody = typesSource.slice(seedStart, seedEnd);
+
+    if (/constraints\?:/.test(seedBody)) {
+      pass('ProjectSeed has constraints? field'); passed++;
+    } else {
+      fail('ProjectSeed missing constraints field'); failed++;
+    }
+
+    if (/artifact_spec\?:/.test(seedBody)) {
+      pass('ProjectSeed has artifact_spec? field'); passed++;
+    } else {
+      fail('ProjectSeed missing artifact_spec field'); failed++;
+    }
+
+    // updateSeed should NOT strip these (they're editable, not lifecycle-protected)
+    const seedManagerSource = fs.readFileSync(path.join(WORLD_BENCH_ROOT, 'orchestrator', 'seed-manager.ts'), 'utf-8');
+    const updateStart = seedManagerSource.indexOf('updateSeed(');
+    const updateEnd = seedManagerSource.indexOf('markRendering', updateStart);
+    const updateBody = seedManagerSource.slice(updateStart, updateEnd);
+    // Check that constraints and artifact_spec are NOT in the strip list
+    if (!/delete sanitized\.constraints/.test(updateBody) && !/delete sanitized\.artifact_spec/.test(updateBody)) {
+      pass('updateSeed leaves constraints + artifact_spec editable (not stripped)'); passed++;
+    } else {
+      fail('updateSeed strips constraints or artifact_spec — should be editable'); failed++;
+    }
+
+    // renderSeedMarkdown renders both new sections
+    if (/seed\.constraints/.test(seedManagerSource) && /## Constraints/.test(seedManagerSource)) {
+      pass('renderSeedMarkdown renders ## Constraints when present'); passed++;
+    } else {
+      fail('renderSeedMarkdown does not render constraints'); failed++;
+    }
+    if (/seed\.artifact_spec/.test(seedManagerSource) && /## Artifact/.test(seedManagerSource)) {
+      pass('renderSeedMarkdown renders ## Artifact when present'); passed++;
+    } else {
+      fail('renderSeedMarkdown does not render artifact_spec'); failed++;
+    }
+  } catch (e: any) {
+    fail(`ProjectSeed growth check failed: ${e.message}`); failed++;
+  }
+
+  // ─── TEST 14: v0.6.3 — system prompt teaches the capability boundary ───
+  console.log('\nTEST 14: system prompt teaches the capability boundary (v0.6.3)');
+  try {
+    const indexSource = fs.readFileSync(path.join(WORLD_BENCH_ROOT, 'orchestrator', 'index.ts'), 'utf-8');
+
+    if (/The Capability Boundary/.test(indexSource)) {
+      pass('system prompt has Capability Boundary section'); passed++;
+    } else {
+      fail('system prompt missing Capability Boundary section'); failed++;
+    }
+
+    if (/canUseTool/.test(indexSource) && /denied/i.test(indexSource)) {
+      pass('system prompt explains canUseTool deny behavior'); passed++;
+    } else {
+      fail('system prompt does not explain canUseTool deny'); failed++;
+    }
+
+    if (/amend_seed/.test(indexSource)) {
+      pass('system prompt documents amend_seed verb'); passed++;
+    } else {
+      fail('system prompt does not document amend_seed'); failed++;
+    }
+  } catch (e: any) {
+    fail(`system prompt check failed: ${e.message}`); failed++;
+  }
+
+  // ─── TEST 15: v0.6.3 — end-to-end amend_seed via SeedManager ───
+  console.log('\nTEST 15: amend_seed end-to-end via SeedManager (v0.6.3)');
+  // Recreate the test seed for this test (TEST 8 cleanup tore it down)
+  try {
+    const turn = uuid();
+    const seed = seedManager.createSeed(
+      TEST_SLUG, 'orig intent', 'orig output shape', [], turn,
+    );
+    // Apply an amend with new constraints + artifact_spec
+    const amended = seedManager.updateSeed(TEST_SLUG, {
+      constraints: { product: ['v1 is one hat, not a hat system'], process: ['shape-cutting is manual'] },
+      artifact_spec: { path: 'world-bench/test/hat.md', format: 'markdown', sections: ['A', 'B'], word_cap: 500 },
+      intent: 'updated intent',
+    });
+    if (amended.constraints?.product?.[0] === 'v1 is one hat, not a hat system') {
+      pass('amend persisted constraints.product'); passed++;
+    } else {
+      fail('amend did not persist constraints.product'); failed++;
+    }
+    if (amended.artifact_spec?.path === 'world-bench/test/hat.md') {
+      pass('amend persisted artifact_spec.path'); passed++;
+    } else {
+      fail('amend did not persist artifact_spec.path'); failed++;
+    }
+    if (amended.intent === 'updated intent') {
+      pass('amend updated editable field (intent)'); passed++;
+    } else {
+      fail('amend did not update intent'); failed++;
+    }
+
+    // Reload from disk and verify the markdown body now contains both sections
+    const onDisk = fs.readFileSync(
+      path.join(WORLD_BENCH_ROOT, 'projects', TEST_SLUG, 'SEED.md'), 'utf-8',
+    );
+    if (/## Constraints/.test(onDisk) && /v1 is one hat/.test(onDisk)) {
+      pass('SEED.md markdown body contains rendered Constraints section'); passed++;
+    } else {
+      fail('SEED.md markdown body missing Constraints section'); failed++;
+    }
+    if (/## Artifact/.test(onDisk) && /world-bench\/test\/hat\.md/.test(onDisk)) {
+      pass('SEED.md markdown body contains rendered Artifact section'); passed++;
+    } else {
+      fail('SEED.md markdown body missing Artifact section'); failed++;
+    }
+  } catch (e: any) {
+    fail(`end-to-end amend test failed: ${e.message}`); failed++;
+  }
+
   // ─── Cleanup ───
   if (fs.existsSync(testProjectDir)) {
     fs.rmSync(testProjectDir, { recursive: true, force: true });

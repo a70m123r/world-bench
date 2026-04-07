@@ -277,6 +277,42 @@ export class SeedManager {
     lines.push('');
     lines.push(seed.output_shape);
     lines.push('');
+
+    // v0.6.3: render artifact_spec inline if present
+    if (seed.artifact_spec) {
+      const a = seed.artifact_spec;
+      lines.push('## Artifact');
+      lines.push('');
+      lines.push(`- **Path:** \`${a.path}\``);
+      lines.push(`- **Format:** ${a.format}`);
+      if (a.sections && a.sections.length > 0) {
+        lines.push(`- **Sections:** ${a.sections.join(' / ')}`);
+      }
+      if (a.word_cap) lines.push(`- **Soft cap:** ~${a.word_cap} words`);
+      if (a.notes) lines.push(`- **Notes:** ${a.notes}`);
+      lines.push('');
+    }
+
+    // v0.6.3: render constraints if present
+    if (seed.constraints && (seed.constraints.product?.length || seed.constraints.process?.length)) {
+      lines.push('## Constraints');
+      lines.push('');
+      if (seed.constraints.product?.length) {
+        lines.push('**Product (what NOT to build):**');
+        for (const c of seed.constraints.product) {
+          lines.push(`- ${c}`);
+        }
+        lines.push('');
+      }
+      if (seed.constraints.process?.length) {
+        lines.push('**Process (how to build):**');
+        for (const c of seed.constraints.process) {
+          lines.push(`- ${c}`);
+        }
+        lines.push('');
+      }
+    }
+
     lines.push('## Lens Sketch (advisory — not executable)');
     lines.push('');
     if (seed.lens_sketch.length === 0) {

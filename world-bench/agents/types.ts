@@ -146,6 +146,30 @@ export interface ProjectSeed {
   ignited_at?: string;
   ignited_at_turn_id?: string;
   legacy_pre_seed?: boolean;  // for grandfathering pre-v0.6 projects
+
+  // v0.6.3: structural fields added to give the seed real homes for the
+  // load-bearing context the Orchestrator was previously stuffing into
+  // markdown body. Both are optional so existing seeds load cleanly.
+  /**
+   * Boundary constraints — what the project will and will not be in v1.
+   * "v1 is one hat, not a hat system." "Shape-cutting is manual." etc.
+   * The Orchestrator should bake these into its reasoning each turn.
+   */
+  constraints?: {
+    product?: string[];   // hard product boundaries — what NOT to build
+    process?: string[];   // process discipline — how to build
+  };
+  /**
+   * The artifact this project will produce, in mechanically-checkable terms.
+   * Path, format, sections, soft caps — anything Pav can later assert against.
+   */
+  artifact_spec?: {
+    path: string;           // e.g. "world-bench/hats/orchestrator/hat.md"
+    format: 'markdown' | 'json' | 'yaml' | 'jsonl' | 'other';
+    sections?: string[];    // for markdown artifacts: required sections
+    word_cap?: number;      // soft cap on length
+    notes?: string;         // freeform anything-else
+  };
 }
 
 export interface LensSketch {
