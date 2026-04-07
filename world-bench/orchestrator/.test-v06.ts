@@ -204,6 +204,81 @@ async function main() {
     fail(`source check failed: ${e.message}`); failed++;
   }
 
+  // ─── TEST 10: rehearse — source-level invariants (v0.6.2) ───
+  // Rehearse is a method on the Orchestrator class which needs Slack tokens to
+  // instantiate. We verify the council-mandated guarantees by reading the source:
+  //   a) rehearse method exists
+  //   b) it requires the project to already exist (no implicit bootstrap)
+  //   c) it does NOT call attachLensToProject or bootstrapProject
+  //   d) it does NOT call markRendering / markComplete (read-only on lifecycle)
+  //   e) it rejects requests for unattached lenses (no silent attach)
+  //   f) the action handler exists and is wired to the parser
+  console.log('\nTEST 10: rehearse — bare verb, no smuggled differentiation (v0.6.2)');
+  try {
+    const indexSource = fs.readFileSync(path.join(WORLD_BENCH_ROOT, 'orchestrator', 'index.ts'), 'utf-8');
+
+    // a) method exists
+    const rehearseStart = indexSource.indexOf('async rehearse(');
+    const rehearseEnd = indexSource.indexOf('private loadLensFromDisk', rehearseStart);
+    if (rehearseStart < 0 || rehearseEnd < 0) {
+      fail('rehearse() method not found in source'); failed++;
+    } else {
+      pass('rehearse() method present'); passed++;
+      const body = indexSource.slice(rehearseStart, rehearseEnd);
+
+      // b) requires project to exist
+      if (/projectExists\(projectSlug\)/.test(body) && /Cannot rehearse: project/i.test(body)) {
+        pass('rehearse refuses missing projects (no implicit bootstrap)'); passed++;
+      } else {
+        fail('rehearse missing projectExists guard'); failed++;
+      }
+
+      // c) no smuggled bootstrap or attach calls
+      if (!/bootstrapProject\(/.test(body) && !/attachLensToProject\(/.test(body)) {
+        pass('rehearse never calls bootstrapProject or attachLensToProject'); passed++;
+      } else {
+        fail('rehearse smuggles bootstrap/attach — composition is leaking into differentiation'); failed++;
+      }
+
+      // d) read-only on the seed lifecycle
+      if (!/markRendering\(/.test(body) && !/markComplete\(/.test(body)) {
+        pass('rehearse never advances seed status (lifecycle read-only)'); passed++;
+      } else {
+        fail('rehearse mutates seed status — should be read-only'); failed++;
+      }
+
+      // e) rejects unattached lenses
+      if (/meta\.lenses\.includes/.test(body) && /not attached/i.test(body)) {
+        pass('rehearse rejects unattached lens slugs'); passed++;
+      } else {
+        fail('rehearse missing attached-lens check'); failed++;
+      }
+
+      // f) refuses draft seeds (must be past ignition)
+      if (/status === 'draft'/.test(body)) {
+        pass('rehearse refuses draft seeds'); passed++;
+      } else {
+        fail('rehearse allows rehearsing draft seeds'); failed++;
+      }
+    }
+
+    // Action handler wired
+    if (/\(response\.action as string\) === 'rehearse'/.test(indexSource)) {
+      pass('rehearse action handler present in dispatcher'); passed++;
+    } else {
+      fail('rehearse action handler missing from dispatcher'); failed++;
+    }
+
+    // Parser branch wired
+    if (/actionData\.action === 'rehearse'/.test(indexSource)) {
+      pass('rehearse parser branch present'); passed++;
+    } else {
+      fail('rehearse parser branch missing'); failed++;
+    }
+  } catch (e: any) {
+    fail(`rehearse source check failed: ${e.message}`); failed++;
+  }
+
   // ─── Cleanup ───
   if (fs.existsSync(testProjectDir)) {
     fs.rmSync(testProjectDir, { recursive: true, force: true });

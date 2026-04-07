@@ -477,6 +477,99 @@ export class Orchestrator {
   // ─── Lens Resume ───
 
   /**
+   * v0.6.2: Rehearse a multi-lens flow.
+   *
+   * Rehearse is *composition*, not *differentiation*. It runs lenses that are
+   * already attached to the project, in an explicit order, with executeRun's
+   * normal seam-chaining (lens A's output becomes lens B's prior context).
+   *
+   * The point is to watch the seam — what crosses the boundary between lenses,
+   * where shape drift happens, whether the contracts hold. No new lenses are
+   * born here. No channels created. No status changes. The seed must already
+   * be ignited (rendering or complete).
+   *
+   * Council direction (v0.6.2):
+   *   - bare verb only — hydrate, run, return per-lens outputs
+   *   - explicit lensSlugs[] order, do NOT infer from creation order
+   *   - no automatic contract mutation
+   *   - no implicit attach/bootstrap fallback
+   *   - per-lens outputs are visible by default (executeRun already does this)
+   *
+   * Returns the same shape as executeRun. Per-lens outputs land in their
+   * respective #wb-lens-* channels; the project channel gets the chain summary.
+   */
+  async rehearse(
+    projectSlug: string,
+    lensSlugs: string[],
+    taskPrompt: string,
+  ): Promise<{ runId: string; results: LensRunResult[]; summary: string }> {
+    if (!Array.isArray(lensSlugs) || lensSlugs.length === 0) {
+      throw new Error('rehearse requires a non-empty lensSlugs array.');
+    }
+
+    // 1. Project must exist (no implicit bootstrap)
+    if (!this.projectExists(projectSlug)) {
+      throw new Error(`Cannot rehearse: project "${projectSlug}" does not exist. Render at least one lens first.`);
+    }
+    const meta = this.loadProjectMeta(projectSlug);
+    if (!meta) {
+      throw new Error(`Cannot rehearse: project.json for "${projectSlug}" is unreadable.`);
+    }
+
+    // 2. Seed must be past draft (any post-ignition status is valid for rehearse).
+    //    Legacy pre-seed projects bypass this gate via the same grandfather path
+    //    used elsewhere — if no seed exists but project.json declares legacy_pre_seed,
+    //    allow rehearsal so old projects don't get locked out.
+    const seed = this.seedManager.loadSeed(projectSlug);
+    if (!seed && !meta.legacy_pre_seed) {
+      throw new Error(`Cannot rehearse: no seed found for "${projectSlug}" and project is not marked legacy_pre_seed.`);
+    }
+    if (seed && seed.status === 'draft') {
+      throw new Error(`Cannot rehearse: seed "${projectSlug}" is still draft. Ignite and render at least one lens before rehearsing.`);
+    }
+
+    // 3. Every requested lens must already be attached. No silent attach.
+    const missing = lensSlugs.filter(slug => !meta.lenses.includes(slug));
+    if (missing.length > 0) {
+      throw new Error(`Cannot rehearse: lens(es) not attached to "${projectSlug}": ${missing.join(', ')}. Render them first via render_lens.`);
+    }
+
+    // 4. Hydrate each lens config from disk in the explicit requested order.
+    //    Order is whatever the caller passed — NOT the order from project.json.
+    //    This is the "explicit pipeline definition" Soren asked for.
+    const lensConfigs: LensConfig[] = [];
+    for (const slug of lensSlugs) {
+      const lens = this.loadLensFromDisk(projectSlug, slug);
+      if (!lens) {
+        throw new Error(`Cannot rehearse: lens.json missing on disk for "${projectSlug}/${slug}".`);
+      }
+      lensConfigs.push(lens);
+    }
+
+    console.log(`[Orchestrator] Rehearsing ${lensConfigs.length} lens(es) for ${projectSlug}: ${lensSlugs.join(' → ')}`);
+
+    // 5. Run via executeRun. It already chains priorOutput between lenses
+    //    (the seam) and posts per-lens outputs to their channels. No status
+    //    advancement here — rehearse is read-only on the seed lifecycle.
+    return await this.executeRun(projectSlug, lensConfigs, taskPrompt);
+  }
+
+  /**
+   * Load a lens config from disk by slug. Used by rehearse() and resumeLens().
+   * Returns null if the lens is not attached to the project.
+   */
+  private loadLensFromDisk(projectSlug: string, lensId: string): LensConfig | null {
+    const lensJsonPath = path.join(WORLD_BENCH_ROOT, 'projects', projectSlug, 'lenses', lensId, 'lens.json');
+    if (!fs.existsSync(lensJsonPath)) return null;
+    try {
+      return JSON.parse(fs.readFileSync(lensJsonPath, 'utf-8'));
+    } catch (e: any) {
+      console.error(`[Orchestrator] Failed to read lens.json for ${projectSlug}/${lensId}: ${e.message}`);
+      return null;
+    }
+  }
+
+  /**
    * Resume a lens from its last session with new context/feedback.
    */
   async resumeLens(
@@ -484,13 +577,11 @@ export class Orchestrator {
     lensId: string,
     newContext: string,
   ): Promise<LensRunResult | null> {
-    const lensJsonPath = path.join(WORLD_BENCH_ROOT, 'projects', projectSlug, 'lenses', lensId, 'lens.json');
-    if (!fs.existsSync(lensJsonPath)) {
+    const lens = this.loadLensFromDisk(projectSlug, lensId);
+    if (!lens) {
       console.error(`[Orchestrator] Lens not found: ${projectSlug}/${lensId}`);
       return null;
     }
-
-    const lens: LensConfig = JSON.parse(fs.readFileSync(lensJsonPath, 'utf-8'));
     const runId = uuid();
 
     this.lensManager.initRun(projectSlug, runId, [lens]);
@@ -617,6 +708,30 @@ export class Orchestrator {
         }
       }
 
+      // rehearse: run already-attached lenses together. Composition, not differentiation.
+      // v0.6.2: lensSlugs[] is the explicit pipeline. Order matters. No new lenses born.
+      if ((response.action as string) === 'rehearse' && response.plan) {
+        try {
+          const plan = response.plan;
+          if (!plan.projectSlug || !Array.isArray(plan.lensSlugs) || plan.lensSlugs.length === 0) {
+            throw new Error('rehearse requires projectSlug and a non-empty lensSlugs array.');
+          }
+          await this.terminal.postToChannel(replyTo,
+            `:performing_arts: Rehearsing \`${plan.projectSlug}\`: ${plan.lensSlugs.join(' → ')}`,
+          );
+          const { summary } = await this.rehearse(
+            plan.projectSlug,
+            plan.lensSlugs,
+            plan.taskPrompt || `Rehearse the flow ${plan.lensSlugs.join(' → ')}.`,
+          );
+          await this.terminal.postToChannel(replyTo,
+            `Rehearsal done. Per-lens outputs are in their lens channels; the seam summary is in \`#wb-proj-${plan.projectSlug}\`. Pav reviews before tuning anything.`,
+          );
+        } catch (e: any) {
+          await this.terminal.postToChannel(replyTo, `:no_entry: Rehearsal failed: ${e.message}`);
+        }
+      }
+
       // ─── Legacy actions (still supported for compatibility) ───
 
       // Resume a lens with new context (v0.5.1)
@@ -673,7 +788,7 @@ export class Orchestrator {
    */
   private async converse(cmd: OrchestratorCommand, currentTurnId: string): Promise<{
     reply: string;
-    action: 'chat' | 'create_project' | 'status' | 'create_seed' | 'ignite_seed' | 'propose_lens' | 'render_lens' | 'resume_lens';
+    action: 'chat' | 'create_project' | 'status' | 'create_seed' | 'ignite_seed' | 'propose_lens' | 'render_lens' | 'rehearse' | 'resume_lens';
     plan?: any;
   }> {
     const { query: sdkQuery } = require('@anthropic-ai/claude-agent-sdk');
@@ -809,6 +924,19 @@ When you want to DO something, write a file to \`${WORLD_BENCH_ROOT}/orchestrato
 }
 \`\`\`
 
+**\`rehearse\`** — run two or more *already-rendered* lenses together to watch the seam. Composition, not differentiation. No new lenses are born here. Order matters — \`lensSlugs\` is the explicit pipeline; lens A's output flows into lens B as prior context. Per-lens outputs land in their respective lens channels; the project channel gets the chain summary. Use this when Pav says "run them together" or "show me how they hand off."
+
+\`\`\`json
+{
+  "action": "rehearse",
+  "projectSlug": "project-slug",
+  "lensSlugs": ["lens-a", "lens-b"],
+  "taskPrompt": "what to feed the first lens"
+}
+\`\`\`
+
+Rules: every slug in \`lensSlugs\` must already be attached to the project (rendered via \`render_lens\` in a prior turn). The seed must be past draft. The order is exactly what you write — the Orchestrator does NOT infer flow from creation order or lens names. Rehearse is read-only on the seed lifecycle.
+
 Be conversational in your text output. If Pav says "hey" — say hey back. If he asks a question — answer it. Only write action files when there's a real next step to commit to.
 
 ## Situational Awareness
@@ -922,7 +1050,7 @@ If you're in a lens channel (#wb-lens-*), read its history. If you're in a proje
 
     // Check if the Orchestrator wrote an action file
     const actionPath = path.join(WORLD_BENCH_ROOT, 'orchestrator', 'action.json');
-    type ActionType = 'chat' | 'create_project' | 'status' | 'create_seed' | 'ignite_seed' | 'propose_lens' | 'render_lens' | 'resume_lens';
+    type ActionType = 'chat' | 'create_project' | 'status' | 'create_seed' | 'ignite_seed' | 'propose_lens' | 'render_lens' | 'rehearse' | 'resume_lens';
     let action: ActionType = 'chat';
     let plan: any = undefined;
 
@@ -955,6 +1083,11 @@ If you're in a lens channel (#wb-lens-*), read its history. If you're in a proje
             // Multi-lens render is now invalid — log and skip
             console.error('[Orchestrator] render_lens with multiple lenses rejected. v0.6 enforces one lens at a time.');
           }
+        } else if (actionData.action === 'rehearse' && actionData.projectSlug && Array.isArray(actionData.lensSlugs) && actionData.lensSlugs.length > 0) {
+          // v0.6.2: rehearse already-attached lenses. Composition, not differentiation.
+          // No lens hydration here — rehearse() loads them from disk in explicit order.
+          action = 'rehearse';
+          plan = actionData;
         }
         // Legacy v0.5.1 actions (deprecated but still parsed)
         else if (actionData.action === 'create_project' && actionData.lenses?.length > 0) {
