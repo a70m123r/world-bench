@@ -122,6 +122,42 @@ export interface AgentAdapter {
   kill(id: string): Promise<void>;
 }
 
+// ─── Project Seed (v0.6) ───
+
+/**
+ * The lawful starting artifact for any World-Bench project.
+ * Pav drops intent → Orchestrator asks questions → drafts a seed → Pav approves
+ * (in a separate turn) → seed ignites → lenses render one at a time.
+ *
+ * Non-collapsible Pav interlock: created_at_turn_id prevents same-turn
+ * create_seed → ignite_seed self-advancement.
+ *
+ * NOTE: first_lens is intentionally NOT in this type. Lens commitment
+ * happens in Phase 3 (propose_lens), not in the seed itself.
+ */
+export interface ProjectSeed {
+  slug: string;
+  intent: string;             // Pav's words preferred
+  output_shape: string;       // what done looks like
+  lens_sketch: LensSketch[];  // ADVISORY ONLY — not executable
+  status: 'draft' | 'ignited' | 'rendering' | 'complete';
+  created_at: string;
+  created_at_turn_id: string; // for non-collapsible Pav interlock
+  ignited_at?: string;
+  ignited_at_turn_id?: string;
+  legacy_pre_seed?: boolean;  // for grandfathering pre-v0.6 projects
+}
+
+export interface LensSketch {
+  slug: string;
+  name: string;
+  purpose: string;
+  // Intentionally NO tools, NO system prompt, NO contracts.
+  // Sketch is debate. Render is commitment.
+}
+
+export type ProjectPhase = 'intake' | 'seed_draft' | 'ignited' | 'rendering' | 'accumulating' | 'complete';
+
 // ─── Project & Run Metadata ───
 
 export interface ProjectMeta {
@@ -130,6 +166,7 @@ export interface ProjectMeta {
   created_at: string;
   project_channel_id?: string;
   lenses: string[];        // lens slugs
+  legacy_pre_seed?: boolean; // grandfather marker for pre-v0.6 projects
 }
 
 export interface RunMeta {
