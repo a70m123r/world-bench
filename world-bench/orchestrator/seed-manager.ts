@@ -111,6 +111,11 @@ export class SeedManager {
 
   /**
    * Update an existing seed (for sketch evolution — amend in place).
+   *
+   * IMPORTANT: this method protects all lifecycle-critical fields from mutation.
+   * Status changes go through dedicated methods (igniteSeed, markRendering,
+   * markComplete) so the interlock and lifecycle invariants stay intact.
+   * (Veil's review note from v0.6 build audit.)
    */
   updateSeed(slug: string, updates: Partial<ProjectSeed>): ProjectSeed {
     const seed = this.loadSeed(slug);
@@ -118,12 +123,47 @@ export class SeedManager {
       throw new Error(`Cannot update: seed "${slug}" does not exist.`);
     }
 
-    // Don't let updates corrupt the interlock fields
-    delete (updates as any).created_at_turn_id;
-    delete (updates as any).created_at;
+    // Strip lifecycle-critical fields from any update payload.
+    // These can only be set via the dedicated lifecycle methods.
+    const sanitized: any = { ...updates };
+    delete sanitized.created_at_turn_id;
+    delete sanitized.created_at;
+    delete sanitized.status;            // status changes go through markRendering/markComplete
+    delete sanitized.ignited_at;
+    delete sanitized.ignited_at_turn_id;
 
-    Object.assign(seed, updates);
+    Object.assign(seed, sanitized);
     this.writeSeedFile(seed);
+    return seed;
+  }
+
+  /**
+   * Advance seed status from `ignited` to `rendering` after the first lens
+   * is attached. Auto-called by attachLensToProject().
+   */
+  markRendering(slug: string): ProjectSeed {
+    const seed = this.loadSeed(slug);
+    if (!seed) throw new Error(`Cannot mark rendering: seed "${slug}" does not exist.`);
+    if (seed.status !== 'ignited') {
+      // Already rendering or complete — no-op
+      return seed;
+    }
+    seed.status = 'rendering';
+    this.writeSeedFile(seed);
+    console.log(`[SeedManager] Seed ${slug} now rendering`);
+    return seed;
+  }
+
+  /**
+   * Mark a seed complete. Pav-driven action — there's no automatic completion
+   * because the Orchestrator can't tell when a project is "done."
+   */
+  markComplete(slug: string): ProjectSeed {
+    const seed = this.loadSeed(slug);
+    if (!seed) throw new Error(`Cannot mark complete: seed "${slug}" does not exist.`);
+    seed.status = 'complete';
+    this.writeSeedFile(seed);
+    console.log(`[SeedManager] Seed ${slug} marked complete`);
     return seed;
   }
 

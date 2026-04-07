@@ -211,62 +211,79 @@ export class Orchestrator {
     // Throws NoIgnitedSeedError if no ignited seed exists.
     this.seedManager.requireIgnited(slug);
 
+    // v0.6: split into bootstrapProject + attachLensToProject so we can
+    // add lenses one at a time instead of all at once.
+    if (!this.projectExists(slug)) {
+      await this.bootstrapProject(name, slug);
+    }
+    for (const lens of lensConfigs) {
+      await this.attachLensToProject(slug, lens);
+    }
+
+    const meta = this.loadProjectMeta(slug);
+    if (!meta) throw new Error(`Project ${slug} bootstrap failed: meta missing`);
+    return meta;
+  }
+
+  /**
+   * Check if a project exists on disk (project.json present).
+   */
+  private projectExists(slug: string): boolean {
+    return fs.existsSync(path.join(WORLD_BENCH_ROOT, 'projects', slug, 'project.json'));
+  }
+
+  /**
+   * Load project metadata from disk.
+   */
+  private loadProjectMeta(slug: string): ProjectMeta | null {
+    const pjPath = path.join(WORLD_BENCH_ROOT, 'projects', slug, 'project.json');
+    if (!fs.existsSync(pjPath)) return null;
+    try {
+      return JSON.parse(fs.readFileSync(pjPath, 'utf-8'));
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * v0.6: Bootstrap a project shell. Creates the project directory + project
+   * Slack channel + project.json. NO lens directories. NO lens channels.
+   * Lenses are attached one at a time via attachLensToProject().
+   */
+  async bootstrapProject(name: string, slug: string): Promise<ProjectMeta> {
     const projectDir = path.join(WORLD_BENCH_ROOT, 'projects', slug);
 
-    // Step 1: Create filesystem
+    // Step 1: Create project filesystem (no lens dirs)
     try {
       fs.mkdirSync(projectDir, { recursive: true });
       fs.mkdirSync(path.join(projectDir, 'runs'), { recursive: true });
-
-      for (const lens of lensConfigs) {
-        const lensDir = path.join(projectDir, 'lenses', lens.id);
-        fs.mkdirSync(path.join(lensDir, 'memory'), { recursive: true });
-        fs.mkdirSync(path.join(lensDir, 'workspace'), { recursive: true });
-        fs.mkdirSync(path.join(lensDir, 'output'), { recursive: true });
-        fs.writeFileSync(
-          path.join(lensDir, 'lens.json'),
-          JSON.stringify(lens, null, 2),
-        );
-      }
+      fs.mkdirSync(path.join(projectDir, 'lenses'), { recursive: true });
     } catch (error: any) {
-      console.error(`[Orchestrator] Filesystem creation failed: ${error.message}`);
-      throw error; // Spec: on directory failure → stop immediately
+      console.error(`[Orchestrator] Project bootstrap failed: ${error.message}`);
+      throw error;
     }
 
-    // Step 2: Create Slack channels
+    // Step 2: Create the project Slack channel
     let projectChannelId: string | undefined;
-    const lensChannelIds: Map<string, string> = new Map();
-
     try {
       projectChannelId = await this.terminal.createChannel(
         `wb-proj-${slug}`,
         `World-Bench project: ${name}`,
       ) || undefined;
-
-      for (const lens of lensConfigs) {
-        const channelId = await this.terminal.createChannel(
-          `wb-lens-${lens.id}`,
-          `Lens: ${lens.name} — ${lens.purpose}`,
-        );
-        if (channelId) {
-          lensChannelIds.set(lens.id, channelId);
-        }
-      }
     } catch (error: any) {
-      // Spec: on Slack failure → clean up directories
       console.error(`[Orchestrator] Slack channel creation failed: ${error.message}`);
-      console.error('[Orchestrator] Rolling back filesystem directories...');
+      console.error('[Orchestrator] Rolling back project directory...');
       fs.rmSync(projectDir, { recursive: true, force: true });
       throw error;
     }
 
-    // Step 3: Write project.json with channel IDs
+    // Step 3: Write project.json
     const meta: ProjectMeta = {
       name,
       slug,
       created_at: new Date().toISOString(),
       project_channel_id: projectChannelId,
-      lenses: lensConfigs.map(l => l.id),
+      lenses: [],
     };
 
     fs.writeFileSync(
@@ -274,18 +291,82 @@ export class Orchestrator {
       JSON.stringify(meta, null, 2),
     );
 
-    // Update lens.json files with their channel IDs
-    for (const lens of lensConfigs) {
-      const channelId = lensChannelIds.get(lens.id);
-      if (channelId) {
-        const lensJsonPath = path.join(projectDir, 'lenses', lens.id, 'lens.json');
-        const lensData = JSON.parse(fs.readFileSync(lensJsonPath, 'utf-8'));
-        lensData.slack_channel_id = channelId;
-        fs.writeFileSync(lensJsonPath, JSON.stringify(lensData, null, 2));
-      }
+    console.log(`[Orchestrator] Project bootstrapped: ${slug}`);
+    return meta;
+  }
+
+  /**
+   * v0.6: Attach a single lens to an existing project. Creates the lens
+   * directory + lens.json + lens Slack channel, then appends to project.json's
+   * lenses array. This is the one-lens-at-a-time path.
+   *
+   * Idempotent: if the lens already exists, returns its existing config without
+   * recreating the channel or rewriting the lens.json.
+   */
+  async attachLensToProject(slug: string, lens: LensConfig): Promise<void> {
+    const meta = this.loadProjectMeta(slug);
+    if (!meta) {
+      throw new Error(`Cannot attach lens: project ${slug} does not exist. Bootstrap it first.`);
     }
 
-    return meta;
+    // Idempotency check — if already attached, no-op
+    if (meta.lenses.includes(lens.id)) {
+      console.log(`[Orchestrator] Lens ${lens.id} already attached to ${slug}, skipping`);
+      return;
+    }
+
+    const lensDir = path.join(WORLD_BENCH_ROOT, 'projects', slug, 'lenses', lens.id);
+
+    // Create lens directory structure
+    try {
+      fs.mkdirSync(path.join(lensDir, 'memory'), { recursive: true });
+      fs.mkdirSync(path.join(lensDir, 'workspace'), { recursive: true });
+      fs.mkdirSync(path.join(lensDir, 'output'), { recursive: true });
+      fs.writeFileSync(
+        path.join(lensDir, 'lens.json'),
+        JSON.stringify(lens, null, 2),
+      );
+    } catch (error: any) {
+      console.error(`[Orchestrator] Lens directory creation failed: ${error.message}`);
+      throw error;
+    }
+
+    // Create lens Slack channel
+    let lensChannelId: string | undefined;
+    try {
+      lensChannelId = await this.terminal.createChannel(
+        `wb-lens-${lens.id}`,
+        `Lens: ${lens.name} — ${lens.purpose}`,
+      ) || undefined;
+    } catch (error: any) {
+      console.error(`[Orchestrator] Lens channel creation failed: ${error.message}`);
+      // Roll back the lens directory only — don't touch the project
+      fs.rmSync(lensDir, { recursive: true, force: true });
+      throw error;
+    }
+
+    // Update lens.json with channel ID
+    if (lensChannelId) {
+      const lensJsonPath = path.join(lensDir, 'lens.json');
+      const lensData = JSON.parse(fs.readFileSync(lensJsonPath, 'utf-8'));
+      lensData.slack_channel_id = lensChannelId;
+      fs.writeFileSync(lensJsonPath, JSON.stringify(lensData, null, 2));
+    }
+
+    // Append to project.json's lenses array
+    meta.lenses.push(lens.id);
+    fs.writeFileSync(
+      path.join(WORLD_BENCH_ROOT, 'projects', slug, 'project.json'),
+      JSON.stringify(meta, null, 2),
+    );
+
+    // Advance seed status: ignited → rendering on first lens attached
+    const seed = this.seedManager.loadSeed(slug);
+    if (seed && seed.status === 'ignited') {
+      this.seedManager.markRendering(slug);
+    }
+
+    console.log(`[Orchestrator] Lens attached: ${slug}/${lens.id}`);
   }
 
   // ─── Workflow Execution ───
@@ -498,22 +579,34 @@ export class Orchestrator {
         );
       }
 
-      // render_lens: spawn the lens after Pav approves. Hard gate ensures seed is ignited.
+      // render_lens: spawn ONE lens at a time. Hard gate ensures seed is ignited.
+      // v0.6 enforces single-lens rendering mechanically — the action takes
+      // exactly one lensConfig, not an array.
       if (response.action === 'render_lens' && response.plan) {
         try {
           const plan = response.plan;
+          if (!plan.lensConfig) {
+            throw new Error('render_lens requires a single lensConfig (not an array). One lens at a time.');
+          }
+          const lens = this.hydrateLensConfig(plan.lensConfig);
           await this.terminal.postToChannel(replyTo,
-            `:dna: Rendering lens for \`${plan.projectSlug}\`...`,
+            `:dna: Rendering lens \`${lens.id}\` for project \`${plan.projectSlug}\`...`,
           );
-          // createProject will throw NoIgnitedSeedError if seed isn't ignited
-          await this.createProject(plan.projectName || plan.projectSlug, plan.projectSlug, plan.lenses);
+          // Hard gate: requireIgnited throws if no ignited seed
+          this.seedManager.requireIgnited(plan.projectSlug);
+          // Bootstrap project on first render, then attach this single lens
+          if (!this.projectExists(plan.projectSlug)) {
+            await this.bootstrapProject(plan.projectName || plan.projectSlug, plan.projectSlug);
+          }
+          await this.attachLensToProject(plan.projectSlug, lens);
+          // Run just this one lens
           const { summary } = await this.executeRun(
             plan.projectSlug,
-            plan.lenses,
-            plan.taskPrompt || 'Run this lens.',
+            [lens],
+            plan.taskPrompt || `Run lens ${lens.name}.`,
           );
           await this.terminal.postToChannel(replyTo,
-            `Done. Check \`#wb-proj-${plan.projectSlug}\` for results.`,
+            `Done. Lens \`${lens.id}\` rendered. Check \`#wb-proj-${plan.projectSlug}\` for results. Pav reviews before next lens proposal.`,
           );
         } catch (e: any) {
           if (e instanceof NoIgnitedSeedError) {
@@ -705,14 +798,14 @@ When you want to DO something, write a file to \`${WORLD_BENCH_ROOT}/orchestrato
 }
 \`\`\`
 
-**\`render_lens\`** — spawn the lens after Pav approves the proposal.
+**\`render_lens\`** — spawn ONE lens at a time. Pav must approve each individually. v0.6 enforces single-lens rendering mechanically — the action takes a single \`lensConfig\`, not an array. After this lens runs and Pav reviews it, propose the next one separately.
 \`\`\`json
 {
   "action": "render_lens",
   "projectSlug": "project-slug",
   "projectName": "Display Name",
   "taskPrompt": "what to do",
-  "lenses": [ /* lens config from propose_lens */ ]
+  "lensConfig": { /* the single lens config from propose_lens */ }
 }
 \`\`\`
 
@@ -848,11 +941,20 @@ If you're in a lens channel (#wb-lens-*), read its history. If you're in a proje
         } else if (actionData.action === 'propose_lens' && actionData.lensConfig) {
           action = 'propose_lens';
           plan = actionData;
-        } else if (actionData.action === 'render_lens' && actionData.lenses?.length > 0) {
-          action = 'render_lens';
-          // Hydrate lens configs with stem cell defaults
-          actionData.lenses = actionData.lenses.map((l: any) => this.hydrateLensConfig(l));
-          plan = actionData;
+        } else if (actionData.action === 'render_lens') {
+          // v0.6: render_lens takes a SINGLE lensConfig, not an array.
+          // One lens at a time, mechanically enforced.
+          // Backward-compat: if we receive `lenses[0]`, treat it as the single lens.
+          if (actionData.lensConfig) {
+            action = 'render_lens';
+            plan = actionData;
+          } else if (actionData.lenses?.length === 1) {
+            action = 'render_lens';
+            plan = { ...actionData, lensConfig: actionData.lenses[0] };
+          } else if (actionData.lenses?.length > 1) {
+            // Multi-lens render is now invalid — log and skip
+            console.error('[Orchestrator] render_lens with multiple lenses rejected. v0.6 enforces one lens at a time.');
+          }
         }
         // Legacy v0.5.1 actions (deprecated but still parsed)
         else if (actionData.action === 'create_project' && actionData.lenses?.length > 0) {
