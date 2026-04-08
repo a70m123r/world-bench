@@ -1178,27 +1178,43 @@ export class Orchestrator {
           }
           const lens = this.hydrateLensConfig(plan.lensConfig);
           // v0.6.5: post meeting message and CAPTURE the thread_ts so subsequent
-          // continue_meet calls in this thread can find the session via threadToSession
+          // continue_meet calls in this thread can find the session via threadToSession.
+          // v0.6.5.1: ALL subsequent meet artifacts (harvester response, meeting complete)
+          // MUST be posted as REPLIES to this wave message so they share one Slack thread
+          // root. Otherwise they're scattered top-level sibling posts and Pav's reply
+          // lands in the wrong thread (the meeting complete's thread, not the wave's),
+          // and threadToSession doesn't know about it. The bound thread MUST be the
+          // visible thread Pav is replying in.
           const meetingNotice = await this.terminal.postToChannelWithTs(replyTo,
-            `:wave: Meeting lens \`${lens.id}\` for project \`${plan.projectSlug}\`. Conversation only — no work runs. Standby for the lens's response...`,
+            `:wave: Meeting lens \`${lens.id}\` for project \`${plan.projectSlug}\`. Conversation only — no work runs. Standby for the lens's response in this thread...`,
           );
           const meetThreadTs = meetingNotice?.ts || cmd.thread_ts || cmd.ts;
           // v0.6.5: thread channel + ts through to meetLens so it can populate
-          // the threadToSession reverse-lookup map (G1)
+          // the threadToSession reverse-lookup map (G1). The bound key here is
+          // (replyTo, meetThreadTs) — and that ts MUST be the wave message's ts
+          // so all subsequent thread replies route correctly.
           const result = await this.meetLens(plan.projectSlug, lens, replyTo, meetThreadTs);
           if (result.status === 'failed') {
+            // v0.6.5.1: failure post threaded under the wave too, so the wave thread
+            // contains the full record of what happened
             await this.terminal.postToChannel(replyTo,
               `:warning: Meeting with lens \`${lens.id}\` failed: ${result.output.slice(0, 500)}`,
+              meetThreadTs,
             );
           } else {
-            // Post the lens's response under its persona so Pav reads it as
-            // the agent itself, not the Orchestrator paraphrasing.
+            // Post the lens's response under its persona, THREADED UNDER the wave
+            // message (v0.6.5.1). The harvester response, the meeting complete post,
+            // and Pav's subsequent replies all live in one Slack thread rooted at
+            // the wave — which is the thread bound in threadToSession. This is the
+            // structural fix that makes thread-aware routing actually work.
             const persona = lens.slackPersona || { username: lens.name, icon_emoji: ':dna:' };
             await this.terminal.postToChannelAs(replyTo, persona,
               result.output || '_(no response captured)_',
+              meetThreadTs,
             );
             await this.terminal.postToChannel(replyTo,
-              `:speech_balloon: Meeting complete. Session \`${result.sessionId?.slice(0, 8) || 'unknown'}\` captured. **Reply directly in this thread to continue the conversation** — your message will be relayed verbatim to the lens. Tag \`@Orchestrator review\` to ask the Orchestrator's read on the lens's last response, or \`@Orchestrator [your message]\` to have the Orchestrator speak to the lens in its own voice. Say "render it" to commit.`,
+              `:speech_balloon: Meeting complete. Session \`${result.sessionId?.slice(0, 8) || 'unknown'}\` captured. *Reply directly in this thread* (the one you're reading right now) to continue the conversation — your message will be relayed verbatim to the lens via thread-aware routing. Tag \`@Orchestrator review\` to ask the Orchestrator's read on the lens's last response. Tag \`@Orchestrator [your message]\` for the Orchestrator to speak to the lens in its own voice. Say "render it" to commit.`,
+              meetThreadTs,
             );
           }
         } catch (e: any) {

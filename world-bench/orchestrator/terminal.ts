@@ -291,12 +291,13 @@ export class Terminal {
     } catch { }
   }
 
-  async postToChannel(channelId: string, text: string): Promise<void> {
+  async postToChannel(channelId: string, text: string, thread_ts?: string): Promise<void> {
     try {
       await this.client.chat.postMessage({
         channel: channelId,
         text,
         unfurl_links: false,
+        ...(thread_ts ? { thread_ts } : {}),
       });
     } catch (error: any) {
       console.error(`[Terminal] Failed to post to ${channelId}:`, error.message);
@@ -328,11 +329,17 @@ export class Terminal {
    * the project channel exists. Different from postAsLens, which posts to the
    * project channel by slug — this targets a channelId directly so it works even
    * when the project hasn't been bootstrapped yet.
+   *
+   * v0.6.5.1: optional thread_ts so the response can be threaded as a reply
+   * (used by meet_lens action handler so the harvester response and meeting
+   * complete post are nested under the wave message — the message bound in
+   * threadToSession — instead of being scattered top-level posts).
    */
   async postToChannelAs(
     channelId: string,
     persona: { username: string; icon_emoji: string },
     text: string,
+    thread_ts?: string,
   ): Promise<void> {
     try {
       await this.client.chat.postMessage({
@@ -341,6 +348,7 @@ export class Terminal {
         username: persona.username,
         icon_emoji: persona.icon_emoji,
         unfurl_links: false,
+        ...(thread_ts ? { thread_ts } : {}),
       });
     } catch (error: any) {
       console.error(`[Terminal] Failed to post as ${persona.username} to ${channelId}:`, error.message);
