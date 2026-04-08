@@ -341,8 +341,12 @@ export class Terminal {
     text: string,
     thread_ts?: string,
   ): Promise<void> {
+    // v0.6.5.2: instrument so we can see when this gets called and detect any
+    // duplicate calls. The Harvester double-post incident in v0.6.5.1 may have
+    // been an @slack/web-api auto-retry — log so we have evidence next time.
+    console.log(`[Terminal] postToChannelAs: persona=${persona.username} channel=${channelId} thread=${thread_ts || '(top-level)'} bytes=${text.length}`);
     try {
-      await this.client.chat.postMessage({
+      const res = await this.client.chat.postMessage({
         channel: channelId,
         text,
         username: persona.username,
@@ -350,6 +354,7 @@ export class Terminal {
         unfurl_links: false,
         ...(thread_ts ? { thread_ts } : {}),
       });
+      console.log(`[Terminal] postToChannelAs ok: ts=${res.ts}`);
     } catch (error: any) {
       console.error(`[Terminal] Failed to post as ${persona.username} to ${channelId}:`, error.message);
     }

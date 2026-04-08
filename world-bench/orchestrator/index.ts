@@ -1205,13 +1205,26 @@ export class Orchestrator {
             // Post the lens's response under its persona, THREADED UNDER the wave
             // message (v0.6.5.1). The harvester response, the meeting complete post,
             // and Pav's subsequent replies all live in one Slack thread rooted at
-            // the wave — which is the thread bound in threadToSession. This is the
-            // structural fix that makes thread-aware routing actually work.
+            // the wave — which is the thread bound in threadToSession.
+            //
+            // v0.6.5.2: chunk the response via splitForSlack so long responses don't
+            // get truncated by Slack's per-message text limit. The production lens
+            // path (executeRun, line 471-478) already does this — the meet path was
+            // missing it. Symptom: Harvester response truncated mid-sentence in one
+            // message, plus a mysterious second empty Harvester message (likely
+            // @slack/web-api auto-retry on transient failure that succeeded server-side
+            // but timed out client-side).
             const persona = lens.slackPersona || { username: lens.name, icon_emoji: ':dna:' };
-            await this.terminal.postToChannelAs(replyTo, persona,
-              result.output || '_(no response captured)_',
-              meetThreadTs,
-            );
+            const rawOutput = result.output || '_(no response captured)_';
+            const chunks = splitForSlack(rawOutput);
+            console.log(`[Orchestrator] Posting ${chunks.length} chunk(s) of harvester response (total ${rawOutput.length} chars) to thread ${meetThreadTs}`);
+            for (let i = 0; i < chunks.length; i++) {
+              const chunk = chunks[i];
+              const labelled = chunks.length > 1
+                ? `${chunk}\n\n_(part ${i + 1}/${chunks.length})_`
+                : chunk;
+              await this.terminal.postToChannelAs(replyTo, persona, labelled, meetThreadTs);
+            }
             await this.terminal.postToChannel(replyTo,
               `:speech_balloon: Meeting complete. Session \`${result.sessionId?.slice(0, 8) || 'unknown'}\` captured. *Reply directly in this thread* (the one you're reading right now) to continue the conversation — your message will be relayed verbatim to the lens via thread-aware routing. Tag \`@Orchestrator review\` to ask the Orchestrator's read on the lens's last response. Tag \`@Orchestrator [your message]\` for the Orchestrator to speak to the lens in its own voice. Say "render it" to commit.`,
               meetThreadTs,
