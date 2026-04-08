@@ -43,6 +43,15 @@ export class Orchestrator {
   private availableMcpTools: string[] = [];
   private seedManager: SeedManager;
 
+  // v0.6.4: pending meet sessions, keyed by `${projectSlug}:${lensId}`.
+  // Populated by meet_lens after a successful meeting. Consumed by
+  // attachLensToProject during render_lens, which writes the sessionId
+  // into the new lens.json so runLens picks it up as resumeSessionId.
+  // In-memory only — if the process restarts between meet and render,
+  // the meeting context is lost and render spawns fresh. That's an
+  // acceptable v1 limitation; persistence can come later if needed.
+  private pendingMeetSessions: Map<string, string> = new Map();
+
   constructor() {
     this.adapter = new ClaudeAgentAdapter();
     this.lensManager = new LensManager(this.adapter, WORLD_BENCH_ROOT);
@@ -303,7 +312,7 @@ export class Orchestrator {
    * Idempotent: if the lens already exists, returns its existing config without
    * recreating the channel or rewriting the lens.json.
    */
-  async attachLensToProject(slug: string, lens: LensConfig): Promise<void> {
+  async attachLensToProject(slug: string, lens: LensConfig, meetSessionId?: string): Promise<void> {
     const meta = this.loadProjectMeta(slug);
     if (!meta) {
       throw new Error(`Cannot attach lens: project ${slug} does not exist. Bootstrap it first.`);
@@ -317,6 +326,15 @@ export class Orchestrator {
 
     const lensDir = path.join(WORLD_BENCH_ROOT, 'projects', slug, 'lenses', lens.id);
 
+    // v0.6.4: if a meet session was provided, persist it into lens.json so
+    // lens-manager.runLens picks it up as resumeSessionId on the first run.
+    // This is the session-continuity bridge between meet_lens and render_lens.
+    const lensWithSession: any = { ...lens };
+    if (meetSessionId) {
+      lensWithSession.sessionId = meetSessionId;
+      console.log(`[Orchestrator] Threading meet session into lens.json for ${slug}/${lens.id}: ${meetSessionId}`);
+    }
+
     // Create lens directory structure
     try {
       fs.mkdirSync(path.join(lensDir, 'memory'), { recursive: true });
@@ -324,7 +342,7 @@ export class Orchestrator {
       fs.mkdirSync(path.join(lensDir, 'output'), { recursive: true });
       fs.writeFileSync(
         path.join(lensDir, 'lens.json'),
-        JSON.stringify(lens, null, 2),
+        JSON.stringify(lensWithSession, null, 2),
       );
     } catch (error: any) {
       console.error(`[Orchestrator] Lens directory creation failed: ${error.message}`);
@@ -570,6 +588,39 @@ export class Orchestrator {
   }
 
   /**
+   * v0.6.4: Meet a lens before render.
+   *
+   * Spawns the stem cell in conversation-only mode (mutation tools stripped),
+   * gives it the meeting prompt, captures its response. Posts the response to
+   * the channel where Pav called meet_lens from. Stores the session ID in
+   * pendingMeetSessions so render_lens can resume the same conversation.
+   *
+   * This is the missing Phase 3 beat the council named in the v0.6.4 escalation:
+   * the stem cell participates in its own briefing before commitment.
+   *
+   * Council guardrails (enforced by lens-manager.runLensMeet):
+   *   - Conversation-only — no research phase, no production phase
+   *   - Mutation tools stripped from the lens's tool list at the SDK layer
+   *   - No artifact writes, no project mutation, no channel/bootstrap side effects
+   *   - Single-pass — Pav calls meet_lens again for another round if needed
+   *
+   * Returns the meeting result + the captured session ID. Caller is responsible
+   * for storing the session ID in pendingMeetSessions and posting the output.
+   */
+  async meetLens(
+    projectSlug: string,
+    lens: LensConfig,
+  ): Promise<{ output: string; sessionId?: string; status: 'completed' | 'failed' }> {
+    const result = await this.lensManager.runLensMeet(lens);
+    if (result.sessionId && result.status === 'completed') {
+      const key = `${projectSlug}:${lens.id}`;
+      this.pendingMeetSessions.set(key, result.sessionId);
+      console.log(`[Orchestrator] Stored meet session for ${key}: ${result.sessionId}`);
+    }
+    return result;
+  }
+
+  /**
    * Resume a lens from its last session with new context/feedback.
    */
   async resumeLens(
@@ -686,13 +737,57 @@ export class Orchestrator {
       if (response.action === 'propose_lens' && response.plan) {
         const { projectSlug, lensConfig } = response.plan;
         await this.terminal.postToChannel(replyTo,
-          `:memo: Lens proposal for \`${projectSlug}\`:\n\`\`\`json\n${JSON.stringify(lensConfig, null, 2)}\n\`\`\`\nReply "render it" to spawn the lens.`,
+          `:memo: Lens proposal for \`${projectSlug}\`:\n\`\`\`json\n${JSON.stringify(lensConfig, null, 2)}\n\`\`\`\nReply "meet it" to introduce the stem cell (recommended), or "render it" to spawn directly.`,
         );
+      }
+
+      // meet_lens: spawn the lens in conversation-only mode for an introduction
+      // before render. The stem cell reads its brief, surfaces questions, flags
+      // contract concerns, suggests amendments. No research, no production, no
+      // artifact writes (mutation tools stripped at the SDK layer by lens-manager).
+      // Single-pass — Pav calls meet_lens again for another round if needed.
+      // The session ID is captured into pendingMeetSessions and consumed by
+      // render_lens for session continuity. v0.6.4.
+      if ((response.action as string) === 'meet_lens' && response.plan) {
+        try {
+          const plan = response.plan;
+          if (!plan.lensConfig) {
+            throw new Error('meet_lens requires a lensConfig.');
+          }
+          if (!plan.projectSlug) {
+            throw new Error('meet_lens requires a projectSlug.');
+          }
+          const lens = this.hydrateLensConfig(plan.lensConfig);
+          await this.terminal.postToChannel(replyTo,
+            `:wave: Meeting lens \`${lens.id}\` for project \`${plan.projectSlug}\`. Conversation only — no work runs. Standby for the lens's response...`,
+          );
+          const result = await this.meetLens(plan.projectSlug, lens);
+          if (result.status === 'failed') {
+            await this.terminal.postToChannel(replyTo,
+              `:warning: Meeting with lens \`${lens.id}\` failed: ${result.output.slice(0, 500)}`,
+            );
+          } else {
+            // Post the lens's response under its persona so Pav reads it as
+            // the agent itself, not the Orchestrator paraphrasing.
+            const persona = lens.slackPersona || { username: lens.name, icon_emoji: ':dna:' };
+            await this.terminal.postToChannelAs(replyTo, persona,
+              result.output || '_(no response captured)_',
+            );
+            await this.terminal.postToChannel(replyTo,
+              `:speech_balloon: Meeting complete. Session \`${result.sessionId?.slice(0, 8) || 'unknown'}\` captured for render continuity. Reply with amendments / questions, or say "meet again" for another round, or "render it" to commit.`,
+            );
+          }
+        } catch (e: any) {
+          await this.terminal.postToChannel(replyTo, `Meeting failed: ${e.message}`);
+        }
       }
 
       // render_lens: spawn ONE lens at a time. Hard gate ensures seed is ignited.
       // v0.6 enforces single-lens rendering mechanically — the action takes
       // exactly one lensConfig, not an array.
+      // v0.6.4: if a meet session exists for this lens, attachLensToProject
+      // threads the sessionId into lens.json so the lens resumes its meeting
+      // history when it starts production work.
       if (response.action === 'render_lens' && response.plan) {
         try {
           const plan = response.plan;
@@ -709,7 +804,14 @@ export class Orchestrator {
           if (!this.projectExists(plan.projectSlug)) {
             await this.bootstrapProject(plan.projectName || plan.projectSlug, plan.projectSlug);
           }
-          await this.attachLensToProject(plan.projectSlug, lens);
+          // v0.6.4: consume any pending meet session for this lens
+          const meetKey = `${plan.projectSlug}:${lens.id}`;
+          const meetSessionId = this.pendingMeetSessions.get(meetKey);
+          if (meetSessionId) {
+            this.pendingMeetSessions.delete(meetKey);
+            console.log(`[Orchestrator] Consuming meet session for ${meetKey}: ${meetSessionId}`);
+          }
+          await this.attachLensToProject(plan.projectSlug, lens, meetSessionId);
           // Run just this one lens
           const { summary } = await this.executeRun(
             plan.projectSlug,
@@ -874,7 +976,7 @@ export class Orchestrator {
       // All protected paths are denied
       if (isProtectedPath(absTarget)) {
         const reason = absTarget.startsWith(path.resolve(root, 'projects'))
-          ? `${absTarget} is owned by SeedManager / LensManager. Mutating it directly bypasses the v0.6 lifecycle interlock. Use an action verb instead: create_seed, ignite_seed, amend_seed, propose_lens, render_lens, rehearse.`
+          ? `${absTarget} is owned by SeedManager / LensManager. Mutating it directly bypasses the v0.6 lifecycle interlock. Use an action verb instead: create_seed, ignite_seed, amend_seed, propose_lens, meet_lens, render_lens, rehearse.`
           : `${absTarget} is outside your write scope. The Orchestrator's only allowed file-write target is orchestrator/action.json. To mutate seeds, use action verbs. To mutate source, ask Spinner.`;
         console.warn(`[canUseTool] DENIED: ${toolName} on ${absTarget}`);
         return {
@@ -890,7 +992,7 @@ export class Orchestrator {
 
   private async converse(cmd: OrchestratorCommand, currentTurnId: string): Promise<{
     reply: string;
-    action: 'chat' | 'create_project' | 'status' | 'create_seed' | 'amend_seed' | 'ignite_seed' | 'propose_lens' | 'render_lens' | 'rehearse' | 'resume_lens';
+    action: 'chat' | 'create_project' | 'status' | 'create_seed' | 'amend_seed' | 'ignite_seed' | 'propose_lens' | 'meet_lens' | 'render_lens' | 'rehearse' | 'resume_lens';
     plan?: any;
   }> {
     const { query: sdkQuery } = require('@anthropic-ai/claude-agent-sdk');
@@ -927,7 +1029,7 @@ You differentiate one lens at a time through conversation with Pav. Later stages
 
 **Phase 2 — Seed Rapture.** When you have enough signal, you draft a seed: \`intent\`, \`output_shape\`, \`lens_sketch\` (advisory — not a pipeline). The seed is the *lawful starting artifact* for any project. Pav must approve in a **separate message** before you can ignite. **Same-turn create→ignite is mechanically blocked.** Don't try.
 
-**Phase 3 — Sketch → Render.** One lens at a time. You propose a real lens config (tools, system prompt, contracts). Pav approves. You render it. You review the output together. **Only after that** do you propose the next lens. Each render requires fresh sign-off.
+**Phase 3 — Sketch → Meet → Render.** One lens at a time. You \`propose_lens\` with a real lens config (brief, contracts, tools). Pav reviews the JSON. Then \`meet_lens\` — the stem cell is spawned in conversation-only mode (mutation tools stripped at the SDK layer), reads its own brief, and surfaces questions, contract concerns, and suggested amendments. The meeting is a real conversation with the agent before commitment, not just a config review. You and Pav respond to its questions, possibly amend the brief, possibly meet again. When the lens is ready and Pav approves, \`render_lens\` commits — the same stem cell session is resumed (so the meeting context is preserved as conversation history) and production work begins. Each render requires fresh sign-off. Only after the lens has run and Pav has reviewed do you propose the next lens.
 
 **Phase 4 — Accumulation.** The seed grows. Each completed lens adds to project memory. The lens sketch can change based on what each rendered lens reveals. Sketch is a hypothesis. Reality is the test.
 
@@ -1037,7 +1139,7 @@ When you want to DO something, write a file to \`${WORLD_BENCH_ROOT}/orchestrato
 { "action": "ignite_seed", "slug": "project-slug" }
 \`\`\`
 
-**\`propose_lens\`** — draft a real lens config from a sketch entry. Pav reviews.
+**\`propose_lens\`** — draft a real lens config from a sketch entry. Pav reviews. After approval, the next step is *not* render — it's \`meet_lens\` (so the stem cell can read its own brief and respond before commitment). The system prompt should be a *brief*, not a recipe: tell the stem cell its goal, framework, and contracts, then trust it to figure out *how*. The stem cell is a specialist, not a worker.
 \`\`\`json
 {
   "action": "propose_lens",
@@ -1046,13 +1148,22 @@ When you want to DO something, write a file to \`${WORLD_BENCH_ROOT}/orchestrato
     "id": "lens-slug",
     "name": "Display Name",
     "purpose": "what this lens does",
-    "systemPrompt": "full instructions",
+    "systemPrompt": "brief: goal, framework, contracts, constraints — NOT step-by-step instructions",
     "tools": ["WebSearch"],
     "slackPersona": { "username": "Name", "icon_emoji": ":gear:" },
     "inputContract": { "description": "", "fields": {} },
     "outputContract": { "description": "", "fields": {} },
-    "researchPhase": { "enabled": false, "prompt": "", "maxDuration": 120 }
+    "researchPhase": { "enabled": true, "prompt": "carry a brick — pull a small sample, examine the real shape, then build", "maxDuration": 180 }
   }
+}
+\`\`\`
+
+**\`meet_lens\`** — introduce the stem cell to its brief before commitment. v0.6.4. The lens is spawned in conversation-only mode (mutation tools stripped at the SDK layer), reads its full system prompt + contracts, and responds with: its understanding of the goal, questions, contract concerns, suggested amendments, and any pushback. No artifact writes, no research run, no production. Single-pass — Pav calls \`meet_lens\` again for another round if needed. The captured session ID is preserved so when \`render_lens\` fires, the same stem cell resumes its conversation history and steps into production with full context. Use this whenever a lens has been proposed and Pav hasn't yet said render — the meeting is part of Phase 3.
+\`\`\`json
+{
+  "action": "meet_lens",
+  "projectSlug": "project-slug",
+  "lensConfig": { /* the same lens config from propose_lens */ }
 }
 \`\`\`
 
@@ -1203,7 +1314,7 @@ If you're in a lens channel (#wb-lens-*), read its history. If you're in a proje
 
     // Check if the Orchestrator wrote an action file
     const actionPath = path.join(WORLD_BENCH_ROOT, 'orchestrator', 'action.json');
-    type ActionType = 'chat' | 'create_project' | 'status' | 'create_seed' | 'amend_seed' | 'ignite_seed' | 'propose_lens' | 'render_lens' | 'rehearse' | 'resume_lens';
+    type ActionType = 'chat' | 'create_project' | 'status' | 'create_seed' | 'amend_seed' | 'ignite_seed' | 'propose_lens' | 'meet_lens' | 'render_lens' | 'rehearse' | 'resume_lens';
     let action: ActionType = 'chat';
     let plan: any = undefined;
 
@@ -1223,6 +1334,10 @@ If you're in a lens channel (#wb-lens-*), read its history. If you're in a proje
           plan = actionData;
         } else if (actionData.action === 'ignite_seed' && actionData.slug) {
           action = 'ignite_seed';
+          plan = actionData;
+        } else if (actionData.action === 'meet_lens' && actionData.lensConfig && actionData.projectSlug) {
+          // v0.6.4: introduce the stem cell to its brief before render
+          action = 'meet_lens';
           plan = actionData;
         } else if (actionData.action === 'propose_lens' && actionData.lensConfig) {
           action = 'propose_lens';

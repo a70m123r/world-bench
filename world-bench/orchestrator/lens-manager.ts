@@ -277,6 +277,89 @@ export class LensManager {
   }
 
   /**
+   * v0.6.4: Meet a lens before render.
+   *
+   * Spawns the stem cell in conversation-only mode with a meeting prompt.
+   * The lens reads its brief, surfaces questions, flags contract concerns,
+   * suggests amendments — and then stops. No research phase. No production.
+   * No artifact writes. Just an introduction conversation.
+   *
+   * Council direction (v0.6.4 escalation, 2026-04-08):
+   *   - "spawn lens in conversation-only mode" (Claw)
+   *   - "lens receives brief + current proposal" (Claw)
+   *   - "allowed outputs: questions, risks, boundary corrections, suggested amendments" (Claw)
+   *   - "forbidden outputs: research run, artifact writes, side effects" (Claw)
+   *   - "the entire value of the meet is that the stem cell surfaces questions
+   *      the Orchestrator can't predict" (Soren)
+   *
+   * Mechanical guardrails (enforced here, not just in the prompt):
+   *   - Tool list is filtered to remove ALL mutation tools (Write/Edit/NotebookEdit/MultiEdit)
+   *     so the lens cannot write artifacts even if its prompt slips
+   *   - Research phase is NOT invoked
+   *   - Production phase is NOT invoked
+   *   - The session ID is captured and returned for render_lens to resume
+   *
+   * Returns the lens's response text + the session ID for resume continuity.
+   */
+  async runLensMeet(
+    lens: LensConfig,
+    introductionPrompt?: string,
+  ): Promise<{ output: string; sessionId?: string; status: 'completed' | 'failed' }> {
+    // Strip all mutation tools from the lens's tool list — meeting is read-only.
+    // The lens still has Read/Glob/Grep/WebSearch/WebFetch (if those were in its
+    // tools list) so it can carry small bricks during the meeting if it wants.
+    const MUTATION_TOOLS = new Set(['Write', 'Edit', 'NotebookEdit', 'MultiEdit']);
+    const meetTools = (lens.tools || []).filter(t => !MUTATION_TOOLS.has(t));
+
+    // Build the meeting prompt. The lens's normal system prompt stays intact
+    // (so it knows its identity, goal, contracts). The meeting framing comes
+    // through the user message — that's the per-call mode signal.
+    const defaultIntro = `MEETING MODE — you have not been rendered yet. This is your introduction.
+
+Read your brief carefully — your goal, your input/output contracts, your constraints, the framework you operate in. Then respond with:
+
+1. *Your understanding of the goal* (one paragraph in your own words — confirms you read it correctly)
+2. *Questions you have* before committing to the work — anything ambiguous, missing, or that would change your approach
+3. *Contract concerns* — any field that's underspecified, that you don't think you can produce, or that you'd shape differently
+4. *Suggested amendments* — concrete proposals if you'd change something in the brief or contract
+5. *Anything you'd push back on* — the brief is not sacred. If something feels wrong, say so.
+
+Do NOT begin work. Do NOT write any files. Do NOT run a research harvest. This is a conversation, not an execution. After Pav reviews your response and (possibly) amends the brief, you'll be invoked again with the production task — at which point your full conversation history will be available to you, so anything you say here is preserved.
+
+If everything looks good and you have no questions, say so explicitly. Silence is not consent.`;
+
+    const meetPrompt = introductionPrompt || defaultIntro;
+
+    // Build context — same as runLens, but no run_id (no run yet), no
+    // research phase, no priorLensOutput. Just identity + brief.
+    const meetContext: Record<string, any> = {
+      systemPrompt: buildLensSystemPrompt(lens),
+      lens_name: lens.name,
+      purpose: lens.purpose,
+      cwd: this.worldBenchRoot, // safe cwd; the lens has no workspace yet
+      deniedTools: [...(lens.permissions?.denied || STEM_CELL_DENIED), ...Array.from(MUTATION_TOOLS)],
+      maxTurns: 5, // meetings are short by design
+    };
+
+    // Wire MCP servers if the lens needs them (e.g. to read sample data).
+    // Slack MCP read tools stay available so the lens can carry a brick.
+    const mcpToolNames = meetTools.filter(t => t.startsWith('mcp__'));
+    if (mcpToolNames.length > 0 && this.mcpServers) {
+      meetContext.mcpServers = this.mcpServers;
+      meetContext.mcpTools = mcpToolNames;
+    }
+
+    console.log(`[LensManager] Meeting lens "${lens.id}" with ${meetTools.length} tool(s) (mutation tools stripped)`);
+    const result = await this.adapter.spawn(meetPrompt, meetTools, meetContext);
+
+    return {
+      output: result.output,
+      sessionId: (result as any).sessionId,
+      status: result.status,
+    };
+  }
+
+  /**
    * Spawn with timeout enforcement for research phases.
    * If maxDuration exceeded, kills agent, returns partial output.
    */

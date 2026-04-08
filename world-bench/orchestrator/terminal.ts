@@ -244,6 +244,31 @@ export class Terminal {
     }
   }
 
+  /**
+   * v0.6.4: Post to an arbitrary channel with a persona override (username + icon).
+   * Used by meet_lens to post the stem cell's response as the lens persona before
+   * the project channel exists. Different from postAsLens, which posts to the
+   * project channel by slug — this targets a channelId directly so it works even
+   * when the project hasn't been bootstrapped yet.
+   */
+  async postToChannelAs(
+    channelId: string,
+    persona: { username: string; icon_emoji: string },
+    text: string,
+  ): Promise<void> {
+    try {
+      await this.client.chat.postMessage({
+        channel: channelId,
+        text,
+        username: persona.username,
+        icon_emoji: persona.icon_emoji,
+        unfurl_links: false,
+      });
+    } catch (error: any) {
+      console.error(`[Terminal] Failed to post as ${persona.username} to ${channelId}:`, error.message);
+    }
+  }
+
   async postToOrchestrator(text: string): Promise<void> {
     if (!this.orchestratorChannelId) return;
     try {

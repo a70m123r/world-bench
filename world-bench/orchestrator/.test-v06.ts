@@ -500,6 +500,129 @@ async function main() {
     fail(`end-to-end amend test failed: ${e.message}`); failed++;
   }
 
+  // ─── TEST 16: v0.6.4 — meet_lens action verb ───
+  console.log('\nTEST 16: meet_lens verb — conversation-only stem cell introduction (v0.6.4)');
+  try {
+    const indexSource = fs.readFileSync(path.join(WORLD_BENCH_ROOT, 'orchestrator', 'index.ts'), 'utf-8');
+    const lensManagerSource = fs.readFileSync(path.join(WORLD_BENCH_ROOT, 'orchestrator', 'lens-manager.ts'), 'utf-8');
+
+    // a) ActionType union includes meet_lens
+    if (/'meet_lens'/.test(indexSource)) {
+      pass('meet_lens in ActionType union'); passed++;
+    } else {
+      fail('meet_lens missing from ActionType union'); failed++;
+    }
+
+    // b) Action handler present in dispatcher
+    if (/\(response\.action as string\) === 'meet_lens'/.test(indexSource)) {
+      pass('meet_lens action handler present'); passed++;
+    } else {
+      fail('meet_lens action handler missing'); failed++;
+    }
+
+    // c) Parser branch present
+    if (/actionData\.action === 'meet_lens'/.test(indexSource)) {
+      pass('meet_lens parser branch present'); passed++;
+    } else {
+      fail('meet_lens parser branch missing'); failed++;
+    }
+
+    // d) Orchestrator.meetLens method exists and calls runLensMeet
+    if (/async meetLens\(/.test(indexSource) && /this\.lensManager\.runLensMeet\(/.test(indexSource)) {
+      pass('Orchestrator.meetLens routes through lens-manager.runLensMeet'); passed++;
+    } else {
+      fail('Orchestrator.meetLens does not route through runLensMeet'); failed++;
+    }
+
+    // e) lens-manager has runLensMeet method
+    if (/async runLensMeet\(/.test(lensManagerSource)) {
+      pass('lens-manager.runLensMeet present'); passed++;
+    } else {
+      fail('lens-manager.runLensMeet missing'); failed++;
+    }
+
+    // f) runLensMeet strips mutation tools
+    const meetStart = lensManagerSource.indexOf('async runLensMeet(');
+    const meetEnd = lensManagerSource.indexOf('private async spawnWithTimeout', meetStart);
+    const meetBody = lensManagerSource.slice(meetStart, meetEnd);
+    if (/MUTATION_TOOLS/.test(meetBody) && /'Write'/.test(meetBody) && /'Edit'/.test(meetBody) && /\.filter\(/.test(meetBody)) {
+      pass('runLensMeet strips Write/Edit/NotebookEdit/MultiEdit from tool list'); passed++;
+    } else {
+      fail('runLensMeet does not strip mutation tools'); failed++;
+    }
+
+    // g) runLensMeet does NOT call research or production phases
+    if (!/buildResearchPrompt\(/.test(meetBody) && !/buildProductionPrompt\(/.test(meetBody)) {
+      pass('runLensMeet never invokes research or production phases'); passed++;
+    } else {
+      fail('runLensMeet smuggles research or production phase'); failed++;
+    }
+
+    // h) runLensMeet returns sessionId for resume
+    if (/sessionId:/.test(meetBody) && /result.*sessionId/.test(meetBody)) {
+      pass('runLensMeet captures and returns sessionId for resume continuity'); passed++;
+    } else {
+      fail('runLensMeet does not return sessionId'); failed++;
+    }
+
+    // i) pendingMeetSessions map exists on Orchestrator
+    if (/pendingMeetSessions: Map<string, string>/.test(indexSource)) {
+      pass('Orchestrator has pendingMeetSessions map'); passed++;
+    } else {
+      fail('pendingMeetSessions map missing'); failed++;
+    }
+
+    // j) attachLensToProject accepts optional meetSessionId
+    if (/attachLensToProject\(slug: string, lens: LensConfig, meetSessionId\?: string\)/.test(indexSource)) {
+      pass('attachLensToProject accepts optional meetSessionId'); passed++;
+    } else {
+      fail('attachLensToProject missing meetSessionId parameter'); failed++;
+    }
+
+    // k) render_lens consumes pendingMeetSessions and threads to attachLensToProject
+    const renderStart = indexSource.indexOf("if (response.action === 'render_lens'");
+    const renderEnd = indexSource.indexOf('// rehearse:', renderStart);
+    const renderBody = indexSource.slice(renderStart, renderEnd);
+    if (/pendingMeetSessions\.get/.test(renderBody) && /pendingMeetSessions\.delete/.test(renderBody) && /attachLensToProject\([^)]+meetSessionId\)/.test(renderBody)) {
+      pass('render_lens consumes pendingMeetSessions and threads sessionId to attachLensToProject'); passed++;
+    } else {
+      fail('render_lens does not consume pending meet sessions'); failed++;
+    }
+
+    // l) attachLensToProject writes meetSessionId into lens.json on creation
+    const attachStart = indexSource.indexOf('async attachLensToProject(');
+    const attachEnd = indexSource.indexOf('// ─── Workflow Execution ───', attachStart);
+    const attachBody = indexSource.slice(attachStart, attachEnd);
+    if (/lensWithSession\.sessionId = meetSessionId/.test(attachBody) && /JSON\.stringify\(lensWithSession/.test(attachBody)) {
+      pass('attachLensToProject persists meetSessionId into lens.json'); passed++;
+    } else {
+      fail('attachLensToProject does not persist meetSessionId'); failed++;
+    }
+
+    // m) System prompt documents meet_lens verb (check for the action JSON example)
+    if (/"action": "meet_lens"/.test(indexSource) && /introduce the stem cell/i.test(indexSource)) {
+      pass('system prompt documents meet_lens verb with action JSON example'); passed++;
+    } else {
+      fail('system prompt missing meet_lens documentation'); failed++;
+    }
+
+    // n) Phase 3 description updated to include meet
+    if (/Phase 3 — Sketch → Meet → Render/.test(indexSource)) {
+      pass('Phase 3 description includes Meet beat'); passed++;
+    } else {
+      fail('Phase 3 still says Sketch → Render without Meet'); failed++;
+    }
+
+    // o) canUseTool deny message includes meet_lens in verb list
+    if (/create_seed,.*meet_lens.*render_lens/.test(indexSource)) {
+      pass('canUseTool deny message verb list includes meet_lens'); passed++;
+    } else {
+      fail('canUseTool deny message verb list missing meet_lens'); failed++;
+    }
+  } catch (e: any) {
+    fail(`meet_lens source check failed: ${e.message}`); failed++;
+  }
+
   // ─── Cleanup ───
   if (fs.existsSync(testProjectDir)) {
     fs.rmSync(testProjectDir, { recursive: true, force: true });
