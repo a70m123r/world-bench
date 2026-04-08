@@ -81,6 +81,65 @@ export class Terminal {
       const isHomeChannel = channelId === this.orchestratorChannelId;
 
       if (isHomeChannel) {
+        // v0.6.5 (Soren's structural-not-behavioral rule, G4 wire-format mention parsing):
+        // Thread-aware routing. If this message is in a thread that's bound to an active
+        // lens meeting session, the message goes to the LENS, not to the Orchestrator's
+        // SDK conversation loop. Routing is determined by thread origin, not by content
+        // interpretation. The Orchestrator doesn't get to "decide" whether to relay or
+        // absorb — the answer is already determined by where the message came from.
+        const threadTs = (message as any).thread_ts;
+        if (threadTs && this.botUserId) {
+          // Check if this is in a known lens meet thread
+          const threadKey = `${channelId}:${threadTs}`;
+          const threadBinding = this.orchestrator.threadToSession?.get?.(threadKey);
+          if (threadBinding) {
+            // G4: detect @Orchestrator mention via WIRE FORMAT (user ID), never display name
+            const orcMentionPattern = `<@${this.botUserId}>`;
+            const isOrcTagged = text.includes(orcMentionPattern);
+
+            if (!isOrcTagged) {
+              // RELAY MODE: untagged message in lens thread → forward verbatim to lens
+              console.log(`[Terminal] Relay mode: ${userId} → ${threadBinding.lensId} in thread ${threadKey}`);
+              try {
+                await this.orchestrator.handleLensThreadRelay({
+                  channelId,
+                  threadTs,
+                  binding: threadBinding,
+                  speaker: userId === PAV_USER_ID ? 'pav' : 'orchestrator',
+                  message: text,
+                  triggerTs: (message as any).ts,
+                });
+              } catch (error: any) {
+                console.error('[Terminal] Lens thread relay failed:', error);
+                await this.postToChannel(channelId, `:warning: Relay to ${threadBinding.lensId} failed: ${error.message}`);
+              }
+              return;
+            }
+
+            // INTERVENE / REVIEW MODE: @Orchestrator tagged in lens thread
+            const cleanedForOrc = text.replace(new RegExp(`<@${this.botUserId}(?:\\|[^>]*)?>`, 'g'), '').trim();
+            // Detect "review" trigger (Q11: short, parsable, no args required)
+            const isReview = /^review\b/i.test(cleanedForOrc) && cleanedForOrc.length < 50;
+
+            console.log(`[Terminal] ${isReview ? 'Review' : 'Intervene'} mode: ${userId} → ${threadBinding.lensId} in thread ${threadKey}`);
+            try {
+              await this.orchestrator.handleLensThreadOrchestratorMode({
+                channelId,
+                threadTs,
+                binding: threadBinding,
+                mode: isReview ? 'review' : 'intervene',
+                message: cleanedForOrc,
+                triggerTs: (message as any).ts,
+              });
+            } catch (error: any) {
+              console.error('[Terminal] Lens thread orchestrator-mode failed:', error);
+              await this.postToChannel(channelId, `:warning: ${isReview ? 'Review' : 'Intervene'} failed: ${error.message}`);
+            }
+            return;
+          }
+        }
+
+        // Normal home-channel handling (no lens thread routing matched)
         // Skip messages that are just @mentions — app_mention handler has those
         const isJustMention = this.botUserId && text.includes(`<@${this.botUserId}>`);
         const cleanText = isJustMention
@@ -241,6 +300,25 @@ export class Terminal {
       });
     } catch (error: any) {
       console.error(`[Terminal] Failed to post to ${channelId}:`, error.message);
+    }
+  }
+
+  /**
+   * v0.6.5: Post and return the resulting message metadata (ts, channel).
+   * Used by meet_lens to capture the meet thread root ts so subsequent
+   * continue_meet routing can find the lens session by thread.
+   */
+  async postToChannelWithTs(channelId: string, text: string): Promise<{ ts?: string; channel?: string } | null> {
+    try {
+      const res = await this.client.chat.postMessage({
+        channel: channelId,
+        text,
+        unfurl_links: false,
+      });
+      return { ts: res.ts as string | undefined, channel: res.channel as string | undefined };
+    } catch (error: any) {
+      console.error(`[Terminal] postToChannelWithTs failed for ${channelId}:`, error.message);
+      return null;
     }
   }
 

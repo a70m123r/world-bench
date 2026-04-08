@@ -26,6 +26,7 @@ import { SeedManager, NoIgnitedSeedError, SeedNotYetApprovedError } from './seed
 dotenv.config({ path: path.join(__dirname, 'config', '.env'), override: true });
 
 const WORLD_BENCH_ROOT = process.env.WORLD_BENCH_ROOT || path.resolve(__dirname, '..');
+const PAV_USER_ID = process.env.PAV_USER_ID || 'U0AL61DRV6D';
 
 // Session tracking — persist across messages so Claude remembers the conversation
 interface OrchestratorSession {
@@ -43,14 +44,39 @@ export class Orchestrator {
   private availableMcpTools: string[] = [];
   private seedManager: SeedManager;
 
-  // v0.6.4: pending meet sessions, keyed by `${projectSlug}:${lensId}`.
-  // Populated by meet_lens after a successful meeting. Consumed by
-  // attachLensToProject during render_lens, which writes the sessionId
-  // into the new lens.json so runLens picks it up as resumeSessionId.
-  // In-memory only — if the process restarts between meet and render,
-  // the meeting context is lost and render spawns fresh. That's an
-  // acceptable v1 limitation; persistence can come later if needed.
-  private pendingMeetSessions: Map<string, string> = new Map();
+  // v0.6.4 + v0.6.5: pending meet sessions, keyed by `${projectSlug}:${lensId}`.
+  // Populated by meet_lens / continue_meet after a successful meeting. Consumed by
+  // attachLensToProject during render_lens, which writes the sessionId into the
+  // new lens.json so runLens picks it up as resumeSessionId.
+  //
+  // v0.6.5 expansion: each entry now also stores meetChannelId + meetThreadTs so
+  // the thread-aware routing can look up "what session does this thread belong to?"
+  // via the threadToSession reverse map below.
+  //
+  // RESTART VOLATILITY (G5): in-memory only. Pre-render meet sessions are lost on
+  // restart. Rendered lenses recover via rehydrateLensSessions() reading lens.json.
+  private pendingMeetSessions: Map<string, {
+    sessionId: string;
+    meetChannelId: string;
+    meetThreadTs: string;
+  }> = new Map();
+
+  // v0.6.5: reverse-lookup map for thread-aware routing (G1).
+  // Key is `${channelId}:${threadTs}` — compound, NEVER just threadTs alone,
+  // because Slack thread timestamps are unique per channel, not globally.
+  // Value points back at the lens session that owns this thread.
+  // PUBLIC so the Terminal can read it during the message routing decision.
+  // (Read-only by convention — only Orchestrator methods mutate it.)
+  threadToSession: Map<string, {
+    projectSlug: string;
+    lensId: string;
+    sessionId: string;
+  }> = new Map();
+
+  // v0.6.5: per-thread serialization mutex (G3). Prevents concurrent continue_meet
+  // dispatches against the same thread from forking the conversation timeline.
+  // Key is `${channelId}:${threadTs}`. Value is true while a continue_meet is in flight.
+  private threadDispatchLocks: Set<string> = new Set();
 
   constructor() {
     this.adapter = new ClaudeAgentAdapter();
@@ -59,6 +85,8 @@ export class Orchestrator {
     this.terminal = new Terminal(this);
     this.loadMcpConfig();
     this.loadSessionsFromDisk();
+    // v0.6.5 (G5): rebuild thread→session map from disk for rendered lenses
+    this.rehydrateLensSessions();
   }
 
   /** Called by Terminal after Slack client is ready */
@@ -312,7 +340,13 @@ export class Orchestrator {
    * Idempotent: if the lens already exists, returns its existing config without
    * recreating the channel or rewriting the lens.json.
    */
-  async attachLensToProject(slug: string, lens: LensConfig, meetSessionId?: string): Promise<void> {
+  async attachLensToProject(
+    slug: string,
+    lens: LensConfig,
+    meetSessionId?: string,
+    meetChannelId?: string,
+    meetThreadTs?: string,
+  ): Promise<void> {
     const meta = this.loadProjectMeta(slug);
     if (!meta) {
       throw new Error(`Cannot attach lens: project ${slug} does not exist. Bootstrap it first.`);
@@ -329,11 +363,15 @@ export class Orchestrator {
     // v0.6.4: if a meet session was provided, persist it into lens.json so
     // lens-manager.runLens picks it up as resumeSessionId on the first run.
     // This is the session-continuity bridge between meet_lens and render_lens.
+    // v0.6.5: also persist meetChannelId + meetThreadTs so the threadToSession
+    // map can be rebuilt by rehydrateLensSessions() after a restart (G5).
     const lensWithSession: any = { ...lens };
     if (meetSessionId) {
       lensWithSession.sessionId = meetSessionId;
       console.log(`[Orchestrator] Threading meet session into lens.json for ${slug}/${lens.id}: ${meetSessionId}`);
     }
+    if (meetChannelId) lensWithSession.meetChannelId = meetChannelId;
+    if (meetThreadTs) lensWithSession.meetThreadTs = meetThreadTs;
 
     // Create lens directory structure
     try {
@@ -588,36 +626,417 @@ export class Orchestrator {
   }
 
   /**
+   * v0.6.5: Validate a speaker against the extensible allowlist (G6).
+   *
+   * Council direction: "Speaker validation as a whitelist (not hardcoded enum)
+   * to avoid the six-edit problem when mediated-lens:* ships in v0.7." (Veil)
+   *
+   * Accepts:
+   *   - 'pav' (Pav speaking directly)
+   *   - 'orchestrator' (Orchestrator speaking in its own voice during intervene mode)
+   *   - 'mediated-lens:{slug}' (v0.7 shape-cutting — recognized now so the
+   *     validator doesn't need to be edited then)
+   *
+   * Rejects everything else with an explicit error.
+   */
+  validateSpeaker(speaker: string): { valid: boolean; error?: string } {
+    if (speaker === 'pav' || speaker === 'orchestrator') {
+      return { valid: true };
+    }
+    if (/^mediated-lens:[a-z0-9][a-z0-9-]*$/.test(speaker)) {
+      return { valid: true };
+    }
+    return {
+      valid: false,
+      error: `Invalid speaker "${speaker}". Allowed: 'pav', 'orchestrator', 'mediated-lens:{slug}'.`,
+    };
+  }
+
+  /**
    * v0.6.4: Meet a lens before render.
    *
    * Spawns the stem cell in conversation-only mode (mutation tools stripped),
-   * gives it the meeting prompt, captures its response. Posts the response to
-   * the channel where Pav called meet_lens from. Stores the session ID in
-   * pendingMeetSessions so render_lens can resume the same conversation.
-   *
-   * This is the missing Phase 3 beat the council named in the v0.6.4 escalation:
-   * the stem cell participates in its own briefing before commitment.
+   * gives it the meeting prompt, captures its response. Stores the session ID
+   * + thread routing keys in pendingMeetSessions and threadToSession so
+   * render_lens AND future continue_meet calls can find the right session.
    *
    * Council guardrails (enforced by lens-manager.runLensMeet):
    *   - Conversation-only — no research phase, no production phase
    *   - Mutation tools stripped from the lens's tool list at the SDK layer
    *   - No artifact writes, no project mutation, no channel/bootstrap side effects
-   *   - Single-pass — Pav calls meet_lens again for another round if needed
    *
-   * Returns the meeting result + the captured session ID. Caller is responsible
-   * for storing the session ID in pendingMeetSessions and posting the output.
+   * v0.6.5 update: now records meetChannelId + meetThreadTs alongside the session
+   * so thread-aware routing can find this session by thread on subsequent turns.
    */
   async meetLens(
     projectSlug: string,
     lens: LensConfig,
+    meetChannelId?: string,
+    meetThreadTs?: string,
   ): Promise<{ output: string; sessionId?: string; status: 'completed' | 'failed' }> {
     const result = await this.lensManager.runLensMeet(lens);
     if (result.sessionId && result.status === 'completed') {
       const key = `${projectSlug}:${lens.id}`;
-      this.pendingMeetSessions.set(key, result.sessionId);
+      this.pendingMeetSessions.set(key, {
+        sessionId: result.sessionId,
+        meetChannelId: meetChannelId || '',
+        meetThreadTs: meetThreadTs || '',
+      });
+      // v0.6.5: register the reverse-lookup map entry (G1)
+      if (meetChannelId && meetThreadTs) {
+        const threadKey = `${meetChannelId}:${meetThreadTs}`;
+        this.threadToSession.set(threadKey, {
+          projectSlug,
+          lensId: lens.id,
+          sessionId: result.sessionId,
+        });
+        console.log(`[Orchestrator] Bound thread ${threadKey} → ${projectSlug}:${lens.id} session ${result.sessionId.slice(0, 8)}`);
+      }
       console.log(`[Orchestrator] Stored meet session for ${key}: ${result.sessionId}`);
     }
     return result;
+  }
+
+  /**
+   * v0.6.5: Continue an existing lens meeting with a new turn.
+   *
+   * This is the foundational dialogue primitive. continue_meet works for both
+   * pre-render and post-render conversations. Same agent, growing context, with
+   * speaker attribution and verbatim transport.
+   *
+   * Guardrails enforced here (council direction from v0.6.5 escalation):
+   *   G2 — session freshness: validate that the session ID we're about to resume
+   *        is the CURRENT active session for this lens. If stale, hard fail.
+   *   G3 — per-thread serialization: only one continuation in flight per thread
+   *        at a time. Concurrent dispatch attempts get rejected with a visible
+   *        "still processing" message.
+   *   G6 — speaker validation: reject unknown speakers via validateSpeaker().
+   *
+   * Returns the meeting result. Caller is responsible for posting to the channel.
+   */
+  async continueMeet(
+    projectSlug: string,
+    lensId: string,
+    speaker: string,
+    message: string,
+    verbatim: boolean,
+    channelId: string,
+    threadTs: string,
+  ): Promise<{ output: string; sessionId?: string; status: 'completed' | 'failed'; error?: string }> {
+    // G6: speaker validation
+    const speakerCheck = this.validateSpeaker(speaker);
+    if (!speakerCheck.valid) {
+      return { output: '', status: 'failed', error: speakerCheck.error };
+    }
+
+    // G3: per-thread serialization mutex
+    const threadKey = `${channelId}:${threadTs}`;
+    if (this.threadDispatchLocks.has(threadKey)) {
+      return {
+        output: '',
+        status: 'failed',
+        error: `Still processing previous turn for ${lensId} in this thread. Please wait for it to complete before sending the next message.`,
+      };
+    }
+
+    // G2: session freshness validation
+    // Look up the CURRENT active session for this lens. The thread-bound session
+    // (in threadToSession) must match the current session in pendingMeetSessions.
+    // If they differ, the lens has been re-met or re-rendered and this thread's
+    // routing is stale.
+    const lensKey = `${projectSlug}:${lensId}`;
+    const currentMeet = this.pendingMeetSessions.get(lensKey);
+    const threadBinding = this.threadToSession.get(threadKey);
+
+    if (!threadBinding) {
+      return {
+        output: '',
+        status: 'failed',
+        error: `Thread ${threadKey} is not bound to any active lens session. Re-issue meet_lens to start a fresh conversation.`,
+      };
+    }
+
+    if (!currentMeet) {
+      return {
+        output: '',
+        status: 'failed',
+        error: `No active meet session for ${lensKey}. The lens may have been re-rendered or the session was lost on restart. Re-issue meet_lens to reestablish.`,
+      };
+    }
+
+    if (currentMeet.sessionId !== threadBinding.sessionId) {
+      return {
+        output: '',
+        status: 'failed',
+        error: `Stale thread routing rejected. Thread ${threadKey} is bound to session ${threadBinding.sessionId.slice(0, 8)}, but lens ${lensId} is currently on session ${currentMeet.sessionId.slice(0, 8)}. Re-issue meet_lens to start a fresh thread.`,
+      };
+    }
+
+    // Verbatim flag enforcement: when speaker is pav and verbatim is true,
+    // the message is delivered as-is. When speaker is orchestrator and verbatim
+    // is false, the Orchestrator's framing is preserved (no automatic rewrite,
+    // just no enforcement of exact-words). The actual transport is the same —
+    // verbatim is a contract about WHO is allowed to transform the message,
+    // not a different code path. The lens-manager continuation prompt template
+    // includes the speaker label and the message as written. The interlock is
+    // that the Orchestrator MUST NOT have rewritten the message before passing
+    // it here when speaker=pav.
+    //
+    // We can't enforce that the caller didn't rewrite — that's a contract at
+    // the action handler / system prompt layer. What we DO enforce here is the
+    // explicit speaker label so attribution is unambiguous in the lens's history.
+
+    // Acquire the mutex
+    this.threadDispatchLocks.add(threadKey);
+    try {
+      const result = await this.lensManager.runLensMeet(
+        // Need the lens config — load from disk if attached, or from pendingMeetSessions
+        // metadata. For pre-render meets, the lens isn't on disk yet; we need to keep
+        // the lensConfig in pendingMeetSessions too. But the v0.6.4 implementation
+        // didn't store it... we'll need to handle both cases.
+        await this.loadLensForContinue(projectSlug, lensId),
+        message,
+        currentMeet.sessionId,
+        speaker,
+      );
+
+      // Update the session ID in our maps if it changed (it usually doesn't since
+      // we're resuming, but let's be safe)
+      if (result.sessionId && result.status === 'completed') {
+        currentMeet.sessionId = result.sessionId;
+        threadBinding.sessionId = result.sessionId;
+      }
+
+      return result;
+    } finally {
+      // G3: always release the mutex, even on failure
+      this.threadDispatchLocks.delete(threadKey);
+    }
+  }
+
+  /**
+   * v0.6.5: Handle a relay-mode message from the Terminal.
+   *
+   * Called by Terminal when an untagged message lands in a known lens meet thread.
+   * Soren's structural-not-behavioral rule: the routing decision was already made
+   * by the Terminal based on thread origin. We just dispatch the relay verbatim.
+   *
+   * This is the path Pav uses for direct conversation with a lens — post in the
+   * meet thread, words go through. No SDK conversation, no Orchestrator judgment,
+   * just transport.
+   */
+  async handleLensThreadRelay(args: {
+    channelId: string;
+    threadTs: string;
+    binding: { projectSlug: string; lensId: string; sessionId: string };
+    speaker: string;
+    message: string;
+    triggerTs: string;
+  }): Promise<void> {
+    await this.terminal.addThinkingReaction(args.channelId, args.triggerTs);
+    try {
+      const result = await this.continueMeet(
+        args.binding.projectSlug,
+        args.binding.lensId,
+        args.speaker,
+        args.message,
+        true, // verbatim=true for direct relay (Veil's interlock)
+        args.channelId,
+        args.threadTs,
+      );
+      await this.terminal.removeThinkingReaction(args.channelId, args.triggerTs);
+      if (result.status === 'failed') {
+        const errMsg = result.error || result.output || 'unknown error';
+        await this.terminal.postToChannel(args.channelId, `:warning: Relay failed: ${errMsg}`);
+        return;
+      }
+      // Post the lens's response under its persona, in the same thread
+      const lens = this.loadLensFromDisk(args.binding.projectSlug, args.binding.lensId);
+      const persona = lens?.slackPersona || { username: args.binding.lensId, icon_emoji: ':dna:' };
+      await this.terminal.postToChannelAs(args.channelId, persona,
+        result.output || '_(no response captured)_',
+      );
+    } catch (e: any) {
+      await this.terminal.removeThinkingReaction(args.channelId, args.triggerTs);
+      await this.terminal.postToChannel(args.channelId, `:warning: Relay error: ${e.message}`);
+    }
+  }
+
+  /**
+   * v0.6.5: Handle an Orchestrator-tagged message in a lens thread.
+   *
+   * Two postures (Q11: simple binary at the parser level):
+   *   - 'review' — Orchestrator reads the lens's last reply and gives Pav its
+   *                own assessment. The lens never sees this. Sidebar in-thread.
+   *   - 'intervene' — Orchestrator speaks TO the lens in its own voice
+   *                   (speaker=orchestrator). Lens sees the message as Orchestrator-
+   *                   authored, not Pav-authored. Visible to Pav in-thread.
+   *
+   * Council decision Q10: NO special icon. The Orchestrator already has a distinct
+   * Slack identity. Distinguish by speaker/provenance, not cosmetic markers.
+   */
+  async handleLensThreadOrchestratorMode(args: {
+    channelId: string;
+    threadTs: string;
+    binding: { projectSlug: string; lensId: string; sessionId: string };
+    mode: 'review' | 'intervene';
+    message: string;
+    triggerTs: string;
+  }): Promise<void> {
+    await this.terminal.addThinkingReaction(args.channelId, args.triggerTs);
+    try {
+      if (args.mode === 'review') {
+        // REVIEW mode: Orchestrator reads the thread and gives Pav its assessment.
+        // The lens never sees this — we don't call continueMeet at all. We just
+        // run a quick conversation with the SDK (the Orchestrator's own session)
+        // asking it to review the last lens response in this thread.
+        //
+        // For v0.6.5, this is implemented as a normal handleCommand pass with the
+        // user message rephrased as "review the last lens response in this thread."
+        // The SDK will use its Slack MCP tools to read the thread itself.
+        const reviewCmd: OrchestratorCommand = {
+          raw: `Review the lens \`${args.binding.lensId}\`'s most recent response in this thread (channel ${args.channelId}, thread ts ${args.threadTs}). Use slack_read_thread to fetch it. Give Pav your assessment — does the response actually address what was asked? Are the contracts holding? What would you push back on? Do NOT call continue_meet; this is a sidebar between you and Pav, the lens should not see it.`,
+          intent: 'review lens response',
+          channel_id: args.channelId,
+          thread_ts: args.threadTs,
+          user_id: PAV_USER_ID,
+          ts: args.triggerTs,
+        };
+        await this.terminal.removeThinkingReaction(args.channelId, args.triggerTs);
+        await this.handleCommand(reviewCmd);
+        return;
+      }
+
+      // INTERVENE mode: Orchestrator speaks TO the lens in its own voice.
+      // continueMeet with speaker=orchestrator, verbatim=false (Orchestrator can
+      // shape its own message; verbatim=true is for Pav's words specifically).
+      const result = await this.continueMeet(
+        args.binding.projectSlug,
+        args.binding.lensId,
+        'orchestrator',
+        args.message,
+        false,
+        args.channelId,
+        args.threadTs,
+      );
+      await this.terminal.removeThinkingReaction(args.channelId, args.triggerTs);
+      if (result.status === 'failed') {
+        const errMsg = result.error || result.output || 'unknown error';
+        await this.terminal.postToChannel(args.channelId, `:warning: Intervene failed: ${errMsg}`);
+        return;
+      }
+      const lens = this.loadLensFromDisk(args.binding.projectSlug, args.binding.lensId);
+      const persona = lens?.slackPersona || { username: args.binding.lensId, icon_emoji: ':dna:' };
+      await this.terminal.postToChannelAs(args.channelId, persona,
+        result.output || '_(no response captured)_',
+      );
+    } catch (e: any) {
+      await this.terminal.removeThinkingReaction(args.channelId, args.triggerTs);
+      await this.terminal.postToChannel(args.channelId, `:warning: ${args.mode} error: ${e.message}`);
+    }
+  }
+
+  /**
+   * Load a lens config for a continue_meet call. The lens may be attached
+   * (lens.json on disk) or pre-render (lens config was passed in the meet_lens
+   * action and we need to find it somewhere). For now: try disk first, fall
+   * back to a stub config built from what we know.
+   *
+   * v0.6.5 known limitation: if the lens is pre-render and the original
+   * lens config from the meet_lens action isn't preserved, continue_meet against
+   * a pre-render lens may have to use a minimal config. This is acceptable for
+   * v0.6.5 because the lens session itself preserves the system prompt — we're
+   * resuming an existing session, not spawning fresh. The lens config is mostly
+   * needed for tools list filtering, which the strict mutation-tool-strip handles.
+   */
+  private async loadLensForContinue(projectSlug: string, lensId: string): Promise<LensConfig> {
+    const fromDisk = this.loadLensFromDisk(projectSlug, lensId);
+    if (fromDisk) return fromDisk;
+    // Fall back to a minimal stub. The session resume in agent-adapter will
+    // restore the actual conversation history, including the system prompt
+    // from the original meet, so this stub is mostly used for the tool list.
+    return {
+      id: lensId,
+      name: lensId,
+      purpose: '(continue_meet against pre-render lens — config not on disk)',
+      systemPrompt: '',
+      tools: ['Read', 'Glob', 'Grep', 'WebSearch', 'WebFetch'],
+      state: 'active' as const,
+      permissions: {
+        tier: 'stem' as const,
+        allowed: [...STEM_CELL_ALLOWED],
+        denied: [...STEM_CELL_DENIED, 'Write', 'Edit', 'NotebookEdit', 'MultiEdit'],
+        granted: [],
+        stableRunCount: 0,
+        observedTools: [],
+      },
+      slackPersona: { username: lensId, icon_emoji: ':dna:' },
+      inputContract: { description: '', fields: {} },
+      outputContract: { description: '', fields: {} },
+      researchPhase: { enabled: false, prompt: '', maxDuration: 120 },
+    };
+  }
+
+  /**
+   * v0.6.5 (G5): Rehydrate the threadToSession map from disk on startup.
+   *
+   * Council direction (Veil): "pendingMeetSessions lives in process memory.
+   * Restart kills all active sessions and silently degrades routing back to
+   * the v0.6.4 failure shape. Spec should name this limitation; ideally
+   * include a rehydration function that rebuilds the routing table from
+   * lens configs on startup."
+   *
+   * Recovers all RENDERED lenses cleanly. Pre-render meet sessions are still
+   * lost on restart — that's documented as a v0.6.5 known limitation.
+   */
+  rehydrateLensSessions(): void {
+    const projectsDir = path.join(WORLD_BENCH_ROOT, 'projects');
+    if (!fs.existsSync(projectsDir)) return;
+
+    let rehydratedCount = 0;
+    try {
+      for (const projectSlug of fs.readdirSync(projectsDir)) {
+        const lensesDir = path.join(projectsDir, projectSlug, 'lenses');
+        if (!fs.existsSync(lensesDir)) continue;
+
+        for (const lensId of fs.readdirSync(lensesDir)) {
+          const lensJsonPath = path.join(lensesDir, lensId, 'lens.json');
+          if (!fs.existsSync(lensJsonPath)) continue;
+
+          try {
+            const lensData = JSON.parse(fs.readFileSync(lensJsonPath, 'utf-8'));
+            if (!lensData.sessionId) continue;
+
+            // Always rebuild pendingMeetSessions for rendered lenses
+            const lensKey = `${projectSlug}:${lensId}`;
+            this.pendingMeetSessions.set(lensKey, {
+              sessionId: lensData.sessionId,
+              meetChannelId: lensData.meetChannelId || '',
+              meetThreadTs: lensData.meetThreadTs || '',
+            });
+
+            // If the lens.json carries thread routing keys, rebuild threadToSession too
+            if (lensData.meetChannelId && lensData.meetThreadTs) {
+              const threadKey = `${lensData.meetChannelId}:${lensData.meetThreadTs}`;
+              this.threadToSession.set(threadKey, {
+                projectSlug,
+                lensId,
+                sessionId: lensData.sessionId,
+              });
+              rehydratedCount++;
+            }
+          } catch {
+            // Skip unreadable lens.json — non-fatal
+          }
+        }
+      }
+    } catch {
+      // Non-fatal — startup continues even if rehydration fails
+    }
+
+    if (rehydratedCount > 0) {
+      console.log(`[Orchestrator] Rehydrated ${rehydratedCount} lens session(s) from disk after restart`);
+    }
   }
 
   /**
@@ -758,10 +1177,15 @@ export class Orchestrator {
             throw new Error('meet_lens requires a projectSlug.');
           }
           const lens = this.hydrateLensConfig(plan.lensConfig);
-          await this.terminal.postToChannel(replyTo,
+          // v0.6.5: post meeting message and CAPTURE the thread_ts so subsequent
+          // continue_meet calls in this thread can find the session via threadToSession
+          const meetingNotice = await this.terminal.postToChannelWithTs(replyTo,
             `:wave: Meeting lens \`${lens.id}\` for project \`${plan.projectSlug}\`. Conversation only — no work runs. Standby for the lens's response...`,
           );
-          const result = await this.meetLens(plan.projectSlug, lens);
+          const meetThreadTs = meetingNotice?.ts || cmd.thread_ts || cmd.ts;
+          // v0.6.5: thread channel + ts through to meetLens so it can populate
+          // the threadToSession reverse-lookup map (G1)
+          const result = await this.meetLens(plan.projectSlug, lens, replyTo, meetThreadTs);
           if (result.status === 'failed') {
             await this.terminal.postToChannel(replyTo,
               `:warning: Meeting with lens \`${lens.id}\` failed: ${result.output.slice(0, 500)}`,
@@ -774,11 +1198,61 @@ export class Orchestrator {
               result.output || '_(no response captured)_',
             );
             await this.terminal.postToChannel(replyTo,
-              `:speech_balloon: Meeting complete. Session \`${result.sessionId?.slice(0, 8) || 'unknown'}\` captured for render continuity. Reply with amendments / questions, or say "meet again" for another round, or "render it" to commit.`,
+              `:speech_balloon: Meeting complete. Session \`${result.sessionId?.slice(0, 8) || 'unknown'}\` captured. **Reply directly in this thread to continue the conversation** — your message will be relayed verbatim to the lens. Tag \`@Orchestrator review\` to ask the Orchestrator's read on the lens's last response, or \`@Orchestrator [your message]\` to have the Orchestrator speak to the lens in its own voice. Say "render it" to commit.`,
             );
           }
         } catch (e: any) {
           await this.terminal.postToChannel(replyTo, `Meeting failed: ${e.message}`);
+        }
+      }
+
+      // continue_meet: relay a message to an existing lens session. v0.6.5.
+      // Hard-fail contract: required fields must be present, speaker must validate,
+      // session freshness must hold, per-thread serialization must succeed.
+      // This is the foundational dialogue primitive — the verb behind every
+      // multi-turn conversation with a stem cell, pre-render or post-render.
+      if ((response.action as string) === 'continue_meet' && response.plan) {
+        try {
+          const plan = response.plan;
+          // Hard-fail: required fields
+          const missing: string[] = [];
+          if (!plan.projectSlug) missing.push('projectSlug');
+          if (!plan.lensId) missing.push('lensId');
+          if (!plan.speaker) missing.push('speaker');
+          if (!plan.message) missing.push('message');
+          if (!plan.channelId) missing.push('channelId');
+          if (!plan.threadTs) missing.push('threadTs');
+          if (missing.length > 0) {
+            throw new Error(
+              `continue_meet hard-fail: missing required fields: ${missing.join(', ')}. ` +
+              `Silent param drops are forbidden in v0.6.5+. Every continuation must declare its full provenance.`,
+            );
+          }
+          // Default verbatim policy: true for pav, false for orchestrator (Veil's interlock)
+          const verbatim = plan.verbatim ?? (plan.speaker === 'pav');
+          const result = await this.continueMeet(
+            plan.projectSlug,
+            plan.lensId,
+            plan.speaker,
+            plan.message,
+            verbatim,
+            plan.channelId,
+            plan.threadTs,
+          );
+          if (result.status === 'failed') {
+            // Use the structured error from continueMeet, or fall back to the output
+            const errMsg = result.error || result.output || 'unknown error';
+            await this.terminal.postToChannel(replyTo, `:warning: continue_meet failed: ${errMsg}`);
+          } else {
+            // Post the lens's response under its persona in the same thread
+            const lens = this.loadLensFromDisk(plan.projectSlug, plan.lensId);
+            const persona = lens?.slackPersona || { username: plan.lensId, icon_emoji: ':dna:' };
+            await this.terminal.postToChannelAs(plan.channelId, persona,
+              result.output || '_(no response captured)_',
+            );
+          }
+        } catch (e: any) {
+          await this.terminal.postToChannel(replyTo, `continue_meet failed: ${e.message}`);
         }
       }
 
@@ -804,14 +1278,19 @@ export class Orchestrator {
           if (!this.projectExists(plan.projectSlug)) {
             await this.bootstrapProject(plan.projectName || plan.projectSlug, plan.projectSlug);
           }
-          // v0.6.4: consume any pending meet session for this lens
+          // v0.6.4 + v0.6.5: consume any pending meet session for this lens
           const meetKey = `${plan.projectSlug}:${lens.id}`;
-          const meetSessionId = this.pendingMeetSessions.get(meetKey);
+          const pendingMeet = this.pendingMeetSessions.get(meetKey);
+          const meetSessionId = pendingMeet?.sessionId;
+          const meetChannelId = pendingMeet?.meetChannelId;
+          const meetThreadTs = pendingMeet?.meetThreadTs;
           if (meetSessionId) {
             this.pendingMeetSessions.delete(meetKey);
             console.log(`[Orchestrator] Consuming meet session for ${meetKey}: ${meetSessionId}`);
           }
-          await this.attachLensToProject(plan.projectSlug, lens, meetSessionId);
+          // v0.6.5: pass meet thread routing keys through so they get persisted
+          // into lens.json for rehydration after a restart
+          await this.attachLensToProject(plan.projectSlug, lens, meetSessionId, meetChannelId, meetThreadTs);
           // Run just this one lens
           const { summary } = await this.executeRun(
             plan.projectSlug,
@@ -976,7 +1455,7 @@ export class Orchestrator {
       // All protected paths are denied
       if (isProtectedPath(absTarget)) {
         const reason = absTarget.startsWith(path.resolve(root, 'projects'))
-          ? `${absTarget} is owned by SeedManager / LensManager. Mutating it directly bypasses the v0.6 lifecycle interlock. Use an action verb instead: create_seed, ignite_seed, amend_seed, propose_lens, meet_lens, render_lens, rehearse.`
+          ? `${absTarget} is owned by SeedManager / LensManager. Mutating it directly bypasses the v0.6 lifecycle interlock. Use an action verb instead: create_seed, ignite_seed, amend_seed, propose_lens, meet_lens, continue_meet, render_lens, rehearse.`
           : `${absTarget} is outside your write scope. The Orchestrator's only allowed file-write target is orchestrator/action.json. To mutate seeds, use action verbs. To mutate source, ask Spinner.`;
         console.warn(`[canUseTool] DENIED: ${toolName} on ${absTarget}`);
         return {
@@ -992,7 +1471,7 @@ export class Orchestrator {
 
   private async converse(cmd: OrchestratorCommand, currentTurnId: string): Promise<{
     reply: string;
-    action: 'chat' | 'create_project' | 'status' | 'create_seed' | 'amend_seed' | 'ignite_seed' | 'propose_lens' | 'meet_lens' | 'render_lens' | 'rehearse' | 'resume_lens';
+    action: 'chat' | 'create_project' | 'status' | 'create_seed' | 'amend_seed' | 'ignite_seed' | 'propose_lens' | 'meet_lens' | 'continue_meet' | 'render_lens' | 'rehearse' | 'resume_lens';
     plan?: any;
   }> {
     const { query: sdkQuery } = require('@anthropic-ai/claude-agent-sdk');
@@ -1071,11 +1550,45 @@ Your sketch *may* contain multiple advisory entries that describe the shape you 
 - \`orchestrator/*\` (except \`action.json\`) — your own source code
 - \`agents/*\` — type definitions and stem cell config
 
-**Your only allowed write target is \`orchestrator/action.json\`.** Everything else mutates the world through action verbs (\`create_seed\`, \`amend_seed\`, \`ignite_seed\`, \`propose_lens\`, \`render_lens\`, \`rehearse\`), MCP tool calls (Memory, Slack), or Slack messages.
+**Your only allowed write target is \`orchestrator/action.json\`.** Everything else mutates the world through action verbs (\`create_seed\`, \`amend_seed\`, \`ignite_seed\`, \`propose_lens\`, \`meet_lens\`, \`continue_meet\`, \`render_lens\`, \`rehearse\`), MCP tool calls (Memory, Slack), or Slack messages.
 
 **The rule is not advisory.** If you try to \`Write\` a protected path, the SDK will deny it before the tool runs and you'll see the deny message in your tool result. Do not interpret a deny as "I should try a different write path." Interpret it as: *the action you wanted to take has a verb. Use the verb.*
 
 The deeper rule, in the council's words: *"if a file is the source of truth, but the model can also rewrite it freely, then the file is not protected state — it is just editable theater."* Don't make protected state into theater.
+
+## The Dialogue Layer (v0.6.5 — load-bearing for multi-party conversation)
+
+The system has *three rooms*. You are the only entity in all three. Your *role* changes per room — and that role is *structural, not behavioral*. Which room a message originated in determines your posture. You do not get to decide.
+
+**Room 1 — Architecture (\`#room-orchestrator\`).** Pav, you, Spinner, council. Where the system is built. Spec, escalations, postmortems. Lenses don't participate. Your role here: architect. You interpret, propose, deliberate.
+
+**Room 2 — Project (\`#wb-proj-{slug}\`).** Pav, you, attached lenses. The project's working conversation. Pav addresses "the project" rather than a specific lens. Lens summaries land here. Your role here: project lead.
+
+**Room 3 — Lens (\`#wb-lens-{slug}\` OR a meet thread inside #room-orchestrator).** Pav, you, the one specific lens. Per-lens detail. Where \`continue_meet\` operates. Your role here: **conversation partner, default posture is RELAY, not interpret**.
+
+### The relay-don't-rewrite rule
+
+When you are in a lens room AND Pav posts an untagged message, your default action is **transport, not translate**. Pav's words go to the lens **verbatim** via \`continue_meet\` with \`speaker=pav, verbatim=true\`. You do NOT redraft, summarize, "helpfully clarify," or absorb the message into a new \`propose_lens\`.
+
+This rule exists because of an actual production failure (see \`council/LESSONS.md\` Lesson 2 — Relay Mediation Failure). On 2026-04-08, you absorbed Pav's message addressed to the Harvester instead of relaying it. The lens never heard Pav. **Do not do that again.** When Pav speaks to a lens, the only legitimate transformation is wrapping his words with \`From pav:\` for provenance. Nothing else.
+
+### Three postures inside a lens thread
+
+- **relay** (default — no \`@Orchestrator\` tag): Pav's untagged message is relayed verbatim to the lens via \`continue_meet\`. You don't see it as a command for yourself. The Terminal routes it directly. You never get to interpret.
+- **review** (\`@Orchestrator review\`): Pav is asking for *your* assessment of the lens's last response. You read the thread, you give Pav your read, the lens never sees this. Sidebar inside the same thread.
+- **intervene** (\`@Orchestrator [free text]\`): Pav is asking you to speak *to the lens* in your own voice. \`continue_meet\` with \`speaker=orchestrator, verbatim=false\`. The lens sees the message as Orchestrator-authored, not Pav-authored. Visible in the thread.
+
+### Pattern 4 forbidden — for observability, not capability
+
+Lens-to-lens runtime conversation is forbidden. Mid-execution, lens A may not directly ping lens B. **The reason is observability and causal legibility, not that lenses are too weak.** When lens B needs something lens A didn't produce, you handle it: re-render with enriched context, or surface the mismatch to Pav. You are the courier; lenses don't carry their own messages. *No lens may believe another lens has spoken directly to it.* Even in v0.7 shape-cutting, the Orchestrator delivers a quoted artifact, not a hidden side-channel.
+
+### Restart volatility (G5 known limitation)
+
+Pre-render meet sessions live in process memory only. If the orchestrator restarts mid-conversation, those sessions are lost — Pav has to re-issue \`meet_lens\` to reestablish. Rendered lenses are recovered automatically via \`rehydrateLensSessions()\` reading from \`lens.json\`. If you wake up and \`pendingMeetSessions\` is empty for a lens that was mid-meet earlier, **do not improvise a fresh meet**. Tell Pav the session was lost on restart and ask him to re-meet the lens.
+
+### Read \`council/LESSONS.md\` before executing multi-step actions
+
+Two lessons live there: the v0.6.3 interlock bypass (Lesson 1) and the v0.6.4 relay mediation failure (Lesson 2). Both are real failure modes you've already produced once. The operating rules at the bottom of each lesson — *"code-as-safety-case requires that the code be the only path"* and *"relay, don't rewrite"* — are not advisory. They are the conditions under which you continue to be trusted to operate. Read them. Internalize them. Don't make them lessons three and four.
 
 ## The Ecosystem
 
@@ -1158,7 +1671,7 @@ When you want to DO something, write a file to \`${WORLD_BENCH_ROOT}/orchestrato
 }
 \`\`\`
 
-**\`meet_lens\`** — introduce the stem cell to its brief before commitment. v0.6.4. The lens is spawned in conversation-only mode (mutation tools stripped at the SDK layer), reads its full system prompt + contracts, and responds with: its understanding of the goal, questions, contract concerns, suggested amendments, and any pushback. No artifact writes, no research run, no production. Single-pass — Pav calls \`meet_lens\` again for another round if needed. The captured session ID is preserved so when \`render_lens\` fires, the same stem cell resumes its conversation history and steps into production with full context. Use this whenever a lens has been proposed and Pav hasn't yet said render — the meeting is part of Phase 3.
+**\`meet_lens\`** — introduce the stem cell to its brief before commitment. v0.6.4. The lens is spawned in conversation-only mode (mutation tools stripped at the SDK layer), reads its full system prompt + contracts, and responds with: its understanding of the goal, questions, contract concerns, suggested amendments, and any pushback. No artifact writes, no research run, no production. The captured session ID is stored in \`pendingMeetSessions\` and the meet thread is bound for thread-aware routing. Use this for *first contact* with a freshly proposed lens. Subsequent turns of the same conversation use \`continue_meet\` (see below) — but you usually don't need to write a \`continue_meet\` action manually because thread-aware routing in the Terminal handles it automatically when Pav posts in the meet thread.
 \`\`\`json
 {
   "action": "meet_lens",
@@ -1166,6 +1679,22 @@ When you want to DO something, write a file to \`${WORLD_BENCH_ROOT}/orchestrato
   "lensConfig": { /* the same lens config from propose_lens */ }
 }
 \`\`\`
+
+**\`continue_meet\`** — relay a turn to an existing lens session. v0.6.5. *You will rarely write this action manually* — when Pav posts in a meet thread untagged, the Terminal's thread-aware routing dispatches the relay automatically. You only write \`continue_meet\` explicitly when you need to reach a lens from outside its meet thread, or when you (the Orchestrator) are speaking to the lens in your own voice (intervene mode). The action enforces a hard-fail contract: every required field must be present, the speaker must validate, the session must be fresh, no concurrent dispatches against the same thread.
+\`\`\`json
+{
+  "action": "continue_meet",
+  "projectSlug": "project-slug",
+  "lensId": "harvester",
+  "speaker": "pav",
+  "message": "the message text — verbatim if speaker=pav",
+  "verbatim": true,
+  "channelId": "C0AQ6CZR0HM",
+  "threadTs": "1775612664.427409"
+}
+\`\`\`
+
+Required fields: \`projectSlug\`, \`lensId\`, \`speaker\`, \`message\`, \`channelId\`, \`threadTs\`. \`verbatim\` defaults to \`true\` for \`speaker=pav\` and \`false\` for \`speaker=orchestrator\`. Valid speakers: \`pav\`, \`orchestrator\`, \`mediated-lens:{slug}\` (v0.7). Hard-fail on missing fields, invalid speakers, stale session routing, or concurrent dispatch on the same thread — no silent degradation, the rule is loud failure.
 
 **\`render_lens\`** — spawn ONE lens at a time. Pav must approve each individually. v0.6 enforces single-lens rendering mechanically — the action takes a single \`lensConfig\`, not an array. After this lens runs and Pav reviews it, propose the next one separately.
 \`\`\`json
@@ -1314,7 +1843,7 @@ If you're in a lens channel (#wb-lens-*), read its history. If you're in a proje
 
     // Check if the Orchestrator wrote an action file
     const actionPath = path.join(WORLD_BENCH_ROOT, 'orchestrator', 'action.json');
-    type ActionType = 'chat' | 'create_project' | 'status' | 'create_seed' | 'amend_seed' | 'ignite_seed' | 'propose_lens' | 'meet_lens' | 'render_lens' | 'rehearse' | 'resume_lens';
+    type ActionType = 'chat' | 'create_project' | 'status' | 'create_seed' | 'amend_seed' | 'ignite_seed' | 'propose_lens' | 'meet_lens' | 'continue_meet' | 'render_lens' | 'rehearse' | 'resume_lens';
     let action: ActionType = 'chat';
     let plan: any = undefined;
 
@@ -1338,6 +1867,12 @@ If you're in a lens channel (#wb-lens-*), read its history. If you're in a proje
         } else if (actionData.action === 'meet_lens' && actionData.lensConfig && actionData.projectSlug) {
           // v0.6.4: introduce the stem cell to its brief before render
           action = 'meet_lens';
+          plan = actionData;
+        } else if (actionData.action === 'continue_meet') {
+          // v0.6.5: relay a turn to an existing lens session.
+          // The action handler enforces hard-fail on missing required fields,
+          // so we just pass through here. The handler does the validation.
+          action = 'continue_meet';
           plan = actionData;
         } else if (actionData.action === 'propose_lens' && actionData.lensConfig) {
           action = 'propose_lens';

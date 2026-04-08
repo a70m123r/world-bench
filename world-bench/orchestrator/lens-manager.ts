@@ -303,8 +303,23 @@ export class LensManager {
    */
   async runLensMeet(
     lens: LensConfig,
-    introductionPrompt?: string,
+    continuationMessage?: string,
+    sessionId?: string,
+    speaker?: string,
   ): Promise<{ output: string; sessionId?: string; status: 'completed' | 'failed' }> {
+    // v0.6.5: Reject mixed states hard. Either both continuationMessage AND sessionId
+    // are provided (continuation mode), or neither is (preflight mode). No silent
+    // degradation. Council direction: "silent resume-drop must become a hard error,
+    // not a silent discard." (Claw + Soren, v0.6.5 escalation thread)
+    const isContinuation = !!continuationMessage || !!sessionId;
+    if (isContinuation && (!continuationMessage || !sessionId)) {
+      throw new Error(
+        `runLensMeet continuation mode requires BOTH continuationMessage AND sessionId. ` +
+        `Got: continuationMessage=${!!continuationMessage}, sessionId=${!!sessionId}. ` +
+        `This is the v0.6.5 hard-fail contract — silent param drops are forbidden.`,
+      );
+    }
+
     // Strip all mutation tools from the lens's tool list — meeting is read-only.
     // The lens still has Read/Glob/Grep/WebSearch/WebFetch (if those were in its
     // tools list) so it can carry small bricks during the meeting if it wants.
@@ -328,7 +343,24 @@ Do NOT begin work. Do NOT write any files. Do NOT run a research harvest. This i
 
 If everything looks good and you have no questions, say so explicitly. Silence is not consent.`;
 
-    const meetPrompt = introductionPrompt || defaultIntro;
+    // v0.6.5: build the user message based on mode
+    let meetPrompt: string;
+    if (isContinuation) {
+      // Continuation mode: format the message with explicit speaker provenance.
+      // This is the speaker attribution invariant — the lens always knows who's
+      // talking. Council: "every continue_meet call carries explicit speaker
+      // provenance. Mediated lens input is quoted artifact, not hidden side-channel
+      // memory." (Claw, v0.6.5 escalation)
+      const speakerLabel = speaker || 'pav';
+      meetPrompt = `CONVERSATION CONTINUES — you've been here before. Read this new turn from the conversation and respond.
+
+From ${speakerLabel}:
+${continuationMessage}
+
+Respond directly to what you just read. You can ask clarifying questions, push back, suggest amendments, or proceed with what they're asking. You still have not been rendered for production work — this is still the meeting phase. If they're asking you to do production work, tell them you're still in meeting mode and need to be explicitly rendered.`;
+    } else {
+      meetPrompt = defaultIntro;
+    }
 
     // Build context — same as runLens, but no run_id (no run yet), no
     // research phase, no priorLensOutput. Just identity + brief.
@@ -341,6 +373,13 @@ If everything looks good and you have no questions, say so explicitly. Silence i
       maxTurns: 5, // meetings are short by design
     };
 
+    // v0.6.5: thread sessionId through to the adapter for resume.
+    // The adapter at agent-adapter.ts:52 already supports `resumeSessionId` —
+    // the plumbing exists, was never connected to the meet path until now.
+    if (sessionId) {
+      meetContext.resumeSessionId = sessionId;
+    }
+
     // Wire MCP servers if the lens needs them (e.g. to read sample data).
     // Slack MCP read tools stay available so the lens can carry a brick.
     const mcpToolNames = meetTools.filter(t => t.startsWith('mcp__'));
@@ -349,7 +388,8 @@ If everything looks good and you have no questions, say so explicitly. Silence i
       meetContext.mcpTools = mcpToolNames;
     }
 
-    console.log(`[LensManager] Meeting lens "${lens.id}" with ${meetTools.length} tool(s) (mutation tools stripped)`);
+    const modeLabel = isContinuation ? `continuation (resume ${sessionId!.slice(0, 8)})` : 'preflight';
+    console.log(`[LensManager] Meeting lens "${lens.id}" in ${modeLabel} mode with ${meetTools.length} tool(s)`);
     const result = await this.adapter.spawn(meetPrompt, meetTools, meetContext);
 
     return {
