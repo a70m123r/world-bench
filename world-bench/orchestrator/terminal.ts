@@ -76,69 +76,82 @@ export class Terminal {
       const userId = (message as any).user || '';
       if (!text.trim()) return;
 
-      // Home channel only — all messages handled.
+      // v0.6.5.3: log every message that reaches the handler so we have evidence
+      // when thread routing should have fired but didn't. This is the diagnostic
+      // surface for the v0.6.5.x routing failures.
+      const _threadTs = (message as any).thread_ts;
+      console.log(`[Terminal] msg in=${channelId} thread=${_threadTs || '(top)'} user=${userId} text=${text.slice(0, 60).replace(/\n/g, ' ')}`);
+
+      // v0.6.5.3: Thread-aware routing fires for ANY channel where a meet thread
+      // is bound, NOT just the orchestrator's home channel. Previous v0.6.5.x code
+      // gated this check on isHomeChannel, which silently broke routing because
+      // the actual home channel (wb-orchestrator, an artifact of findOrCreateChannel)
+      // is different from the channel Pav talks in (room-orchestrator). Lens meet
+      // threads can live in any channel where the meet was initiated — the routing
+      // must follow the threadToSession binding, not the channel identity.
+      //
+      // This is Soren's structural-not-behavioral rule: the routing is determined
+      // by thread origin, not by which channel happens to be "home". The
+      // Orchestrator doesn't get to decide whether to relay or absorb — the answer
+      // is already determined by where the message came from.
+      const threadTs = _threadTs;
+      if (threadTs && this.botUserId) {
+        const threadKey = `${channelId}:${threadTs}`;
+        const threadBinding = this.orchestrator.threadToSession?.get?.(threadKey);
+        if (threadBinding) {
+          // G4: detect @Orchestrator mention via WIRE FORMAT (user ID), never display name
+          const orcMentionPattern = `<@${this.botUserId}>`;
+          const isOrcTagged = text.includes(orcMentionPattern);
+
+          if (!isOrcTagged) {
+            // RELAY MODE: untagged message in lens thread → forward verbatim to lens
+            console.log(`[Terminal] Relay mode: ${userId} → ${threadBinding.lensId} in thread ${threadKey}`);
+            try {
+              await this.orchestrator.handleLensThreadRelay({
+                channelId,
+                threadTs,
+                binding: threadBinding,
+                speaker: userId === PAV_USER_ID ? 'pav' : 'orchestrator',
+                message: text,
+                triggerTs: (message as any).ts,
+              });
+            } catch (error: any) {
+              console.error('[Terminal] Lens thread relay failed:', error);
+              await this.postToChannel(channelId, `:warning: Relay to ${threadBinding.lensId} failed: ${error.message}`);
+            }
+            return;
+          }
+
+          // INTERVENE / REVIEW MODE: @Orchestrator tagged in lens thread
+          const cleanedForOrc = text.replace(new RegExp(`<@${this.botUserId}(?:\\|[^>]*)?>`, 'g'), '').trim();
+          // Detect "review" trigger (Q11: short, parsable, no args required)
+          const isReview = /^review\b/i.test(cleanedForOrc) && cleanedForOrc.length < 50;
+
+          console.log(`[Terminal] ${isReview ? 'Review' : 'Intervene'} mode: ${userId} → ${threadBinding.lensId} in thread ${threadKey}`);
+          try {
+            await this.orchestrator.handleLensThreadOrchestratorMode({
+              channelId,
+              threadTs,
+              binding: threadBinding,
+              mode: isReview ? 'review' : 'intervene',
+              message: cleanedForOrc,
+              triggerTs: (message as any).ts,
+            });
+          } catch (error: any) {
+            console.error('[Terminal] Lens thread orchestrator-mode failed:', error);
+            await this.postToChannel(channelId, `:warning: ${isReview ? 'Review' : 'Intervene'} failed: ${error.message}`);
+          }
+          return;
+        }
+        // No binding for this thread — log it so we know
+        console.log(`[Terminal] thread ${threadKey} has no binding, falling through`);
+      }
+
+      // Home channel only — all (non-thread-routed) messages handled.
       // @mentions in other channels are handled by app_mention event (no double-dispatch).
       const isHomeChannel = channelId === this.orchestratorChannelId;
 
       if (isHomeChannel) {
-        // v0.6.5 (Soren's structural-not-behavioral rule, G4 wire-format mention parsing):
-        // Thread-aware routing. If this message is in a thread that's bound to an active
-        // lens meeting session, the message goes to the LENS, not to the Orchestrator's
-        // SDK conversation loop. Routing is determined by thread origin, not by content
-        // interpretation. The Orchestrator doesn't get to "decide" whether to relay or
-        // absorb — the answer is already determined by where the message came from.
-        const threadTs = (message as any).thread_ts;
-        if (threadTs && this.botUserId) {
-          // Check if this is in a known lens meet thread
-          const threadKey = `${channelId}:${threadTs}`;
-          const threadBinding = this.orchestrator.threadToSession?.get?.(threadKey);
-          if (threadBinding) {
-            // G4: detect @Orchestrator mention via WIRE FORMAT (user ID), never display name
-            const orcMentionPattern = `<@${this.botUserId}>`;
-            const isOrcTagged = text.includes(orcMentionPattern);
-
-            if (!isOrcTagged) {
-              // RELAY MODE: untagged message in lens thread → forward verbatim to lens
-              console.log(`[Terminal] Relay mode: ${userId} → ${threadBinding.lensId} in thread ${threadKey}`);
-              try {
-                await this.orchestrator.handleLensThreadRelay({
-                  channelId,
-                  threadTs,
-                  binding: threadBinding,
-                  speaker: userId === PAV_USER_ID ? 'pav' : 'orchestrator',
-                  message: text,
-                  triggerTs: (message as any).ts,
-                });
-              } catch (error: any) {
-                console.error('[Terminal] Lens thread relay failed:', error);
-                await this.postToChannel(channelId, `:warning: Relay to ${threadBinding.lensId} failed: ${error.message}`);
-              }
-              return;
-            }
-
-            // INTERVENE / REVIEW MODE: @Orchestrator tagged in lens thread
-            const cleanedForOrc = text.replace(new RegExp(`<@${this.botUserId}(?:\\|[^>]*)?>`, 'g'), '').trim();
-            // Detect "review" trigger (Q11: short, parsable, no args required)
-            const isReview = /^review\b/i.test(cleanedForOrc) && cleanedForOrc.length < 50;
-
-            console.log(`[Terminal] ${isReview ? 'Review' : 'Intervene'} mode: ${userId} → ${threadBinding.lensId} in thread ${threadKey}`);
-            try {
-              await this.orchestrator.handleLensThreadOrchestratorMode({
-                channelId,
-                threadTs,
-                binding: threadBinding,
-                mode: isReview ? 'review' : 'intervene',
-                message: cleanedForOrc,
-                triggerTs: (message as any).ts,
-              });
-            } catch (error: any) {
-              console.error('[Terminal] Lens thread orchestrator-mode failed:', error);
-              await this.postToChannel(channelId, `:warning: ${isReview ? 'Review' : 'Intervene'} failed: ${error.message}`);
-            }
-            return;
-          }
-        }
-
         // Normal home-channel handling (no lens thread routing matched)
         // Skip messages that are just @mentions — app_mention handler has those
         const isJustMention = this.botUserId && text.includes(`<@${this.botUserId}>`);
