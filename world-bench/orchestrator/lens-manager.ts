@@ -117,6 +117,13 @@ export class LensManager {
       resumeSessionId,
       permissionManager: this.permissionManager,
       lensConfig: lens,
+      // v0.6.5.8: default production maxTurns raised from 10 to 30. The first
+      // Harvester render (run 09ac10dd, 2026-04-09 03:19:30) hit the 10-turn
+      // ceiling after burning turns on a wrong-Slack-MCP OAuth loop + Bash
+      // quoting failures — before doing any useful work. Research phases + real
+      // implementation legitimately need more than 10 turns. The per-lens
+      // maxTurns override in lens.json takes precedence if present.
+      maxTurns: (lens as any).maxTurns || 30,
     };
 
     // Pass MCP servers to lens if it needs MCP tools

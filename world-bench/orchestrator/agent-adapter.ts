@@ -223,6 +223,23 @@ export class ClaudeAgentAdapter implements AgentAdapter {
     const permissionManager: PermissionManager | undefined = context.permissionManager;
     const lensConfig: LensConfig | undefined = context.lensConfig;
 
+    // v0.6.5.8: prefix matching for denied tools. Entries ending in '*' are
+    // treated as prefix matches (e.g. 'mcp__plugin_slack_slack__*' blocks
+    // every tool whose name starts with 'mcp__plugin_slack_slack__'). Exact
+    // matches still work unchanged. Used to block the default Claude Code
+    // plugin Slack MCP so lenses can't accidentally grab it instead of the
+    // pre-authenticated internal Slack MCP from mcp-servers.json.
+    const isDenied = (toolName: string): boolean => {
+      for (const entry of deniedTools) {
+        if (entry.endsWith('*')) {
+          if (toolName.startsWith(entry.slice(0, -1))) return true;
+        } else if (entry === toolName) {
+          return true;
+        }
+      }
+      return false;
+    };
+
     return {
       // Permission enforcement via elevation loop
       PreToolUse: [{
@@ -230,7 +247,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
           const toolName = input.tool_name || '';
 
           // If tool is not in the denied list, allow it
-          if (!deniedTools.includes(toolName)) {
+          if (!isDenied(toolName)) {
             return { hookEventName: 'PreToolUse', permissionDecision: 'defer' };
           }
 

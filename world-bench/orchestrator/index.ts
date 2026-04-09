@@ -529,14 +529,15 @@ export class Orchestrator {
     // Finalize run
     const meta = this.lensManager.finalizeRun(projectSlug, runId, results);
 
-    // Build final summary
-    const summary = this.buildRunSummary(results, meta);
+    // Build final summary (v0.6.5.8: pass projectSlug + runId so the failure
+    // detail extractor can find the events.jsonl file for any failed lenses)
+    const summary = this.buildRunSummary(results, meta, projectSlug, runId);
     await this.terminal.postToProject(projectSlug, summary);
 
     return { runId, results, summary };
   }
 
-  private buildRunSummary(results: LensRunResult[], meta: any): string {
+  private buildRunSummary(results: LensRunResult[], meta: any, projectSlug?: string, runId?: string): string {
     const lines: string[] = [];
     lines.push(`**Run Complete** — Status: \`${meta.status}\``);
     lines.push('');
@@ -545,12 +546,77 @@ export class Orchestrator {
       const status = r.productionResult?.status || 'skipped';
       const icon = status === 'completed' ? ':white_check_mark:' : ':x:';
       lines.push(`${icon} **${r.lens.name}**: ${status}`);
+
+      // v0.6.5.8: "degrade, don't kill" — when a lens fails, surface the actual
+      // reason inline instead of burying it in events.jsonl. Pav noted (2026-04-09
+      // 03:24:25): "expected it to ping us or you when it hit a wall in this
+      // channel with more detail on its thinking in its dedicated channel".
+      //
+      // Read the events.jsonl tail and extract the last `error` event + the last
+      // `message` (tool call) so Pav sees "what failed" + "what it was trying
+      // to do when it failed" directly in the project channel, no jsonl hunting.
+      if (status === 'failed' && projectSlug && runId) {
+        const detail = this.extractFailureDetail(projectSlug, runId, r.lens.name);
+        if (detail) {
+          lines.push(`> ${detail.replace(/\n/g, '\n> ')}`);
+        }
+      }
     }
 
     lines.push('');
     lines.push('_Full output in each lens channel. Dive in for details._');
 
     return lines.join('\n');
+  }
+
+  /**
+   * v0.6.5.8: read the tail of events.jsonl for a failed lens and return a
+   * short summary: last error message + last tool call. Best-effort — returns
+   * undefined on any read failure. The goal is to give Pav enough context to
+   * decide what to do next without having to ssh into the events file.
+   */
+  private extractFailureDetail(projectSlug: string, runId: string, lensName: string): string | undefined {
+    if (!projectSlug || !runId) return undefined;
+    const eventsPath = path.join(
+      WORLD_BENCH_ROOT, 'projects', projectSlug, 'runs', runId, 'events.jsonl',
+    );
+    try {
+      if (!fs.existsSync(eventsPath)) return undefined;
+      const raw = fs.readFileSync(eventsPath, 'utf-8');
+      const lines = raw.trim().split('\n').filter(Boolean);
+      if (lines.length === 0) return undefined;
+
+      // Walk backwards, collect the last error + last tool call for this lens
+      let lastError: string | undefined;
+      let lastTool: string | undefined;
+      for (let i = lines.length - 1; i >= 0; i--) {
+        try {
+          const event = JSON.parse(lines[i]);
+          if (event.actor !== lensName && event.actor !== 'orchestrator') continue;
+          if (!lastError && event.type === 'error') {
+            lastError = (event.content || '').toString().slice(0, 400);
+          }
+          if (!lastError && event.type === 'state_change' && /failed|error|maximum/i.test(event.content || '')) {
+            lastError = (event.content || '').toString().slice(0, 400);
+          }
+          if (!lastTool && event.type === 'message' && event.content?.startsWith?.('Tool:')) {
+            const toolName = event.metadata?.tool || event.content.replace(/^Tool:\s*/, '');
+            lastTool = toolName;
+          }
+          if (lastError && lastTool) break;
+        } catch {
+          // Skip malformed line
+        }
+      }
+
+      const parts: string[] = [];
+      if (lastError) parts.push(`:warning: **Error**: ${lastError}`);
+      if (lastTool) parts.push(`:wrench: **Last tool**: \`${lastTool}\``);
+      if (parts.length === 0) return undefined;
+      return parts.join('\n');
+    } catch {
+      return undefined;
+    }
   }
 
   // ─── Lens Resume ───

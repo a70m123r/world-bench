@@ -48,6 +48,18 @@ export interface LensPermissions {
 /** Hard sandbox limits for stem cell lenses — only Bash denied from birth. */
 export const STEM_CELL_DENIED: string[] = [
   'Bash',         // no shell access until explicitly granted — too powerful
+  // v0.6.5.8: block the default Claude Code plugin Slack MCP server. The
+  // orchestrator ships its own pre-authenticated Slack MCP (mcp-servers.json
+  // → "slack") and lenses should use THAT, not the plugin one which requires
+  // per-user OAuth and triggers a browser redirect inside a lens session. The
+  // first Harvester production run (run 09ac10dd, 2026-04-09) burned all its
+  // turns calling mcp__plugin_slack_slack__authenticate trying to acquire an
+  // OAuth token it could never receive inside a headless lens session.
+  //
+  // Trailing '*' is a prefix-match marker (see permission-manager's elevation
+  // check and agent-adapter's PreToolUse hook — both understand the '*' suffix
+  // as "block any tool starting with this prefix").
+  'mcp__plugin_slack_slack__*',
 ];
 
 /** Default tools available to all stem cell lenses. Light guardrails. */
