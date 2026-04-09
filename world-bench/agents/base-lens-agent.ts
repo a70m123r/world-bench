@@ -22,13 +22,30 @@ export function buildLensSystemPrompt(config: LensConfig): string {
     sections.push(config.systemPrompt);
   }
 
+  // v0.6.5.6: `desc` is declared as string in types.ts but the Orchestrator's
+  // generate_lens SDK action produces structured JSON values for contract fields
+  // in practice (e.g. `{type: "array", items: {...}}` for nested shapes). A naive
+  // template literal `${desc}` invokes .toString() on objects, producing the
+  // literal string "[object Object]" — which the Harvester saw in its meet
+  // response and correctly flagged as a contract rendering bug. This helper
+  // renders strings as-is and JSON-stringifies objects with indentation.
+  const renderField = (desc: unknown): string => {
+    if (typeof desc === 'string') return desc;
+    if (desc === null || desc === undefined) return '(unspecified)';
+    try {
+      return '\n```json\n' + JSON.stringify(desc, null, 2) + '\n```';
+    } catch {
+      return String(desc);
+    }
+  };
+
   // Input contract
   sections.push('## Input Contract');
   sections.push(config.inputContract.description);
   if (Object.keys(config.inputContract.fields).length > 0) {
     sections.push('Expected fields:');
     for (const [field, desc] of Object.entries(config.inputContract.fields)) {
-      sections.push(`- **${field}**: ${desc}`);
+      sections.push(`- **${field}**: ${renderField(desc)}`);
     }
   }
 
@@ -38,7 +55,7 @@ export function buildLensSystemPrompt(config: LensConfig): string {
   if (Object.keys(config.outputContract.fields).length > 0) {
     sections.push('You must produce:');
     for (const [field, desc] of Object.entries(config.outputContract.fields)) {
-      sections.push(`- **${field}**: ${desc}`);
+      sections.push(`- **${field}**: ${renderField(desc)}`);
     }
   }
 

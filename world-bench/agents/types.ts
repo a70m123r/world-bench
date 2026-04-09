@@ -10,7 +10,13 @@ export interface SlackPersona {
 
 export interface ContractSpec {
   description: string;
-  fields: Record<string, string>;
+  // v0.6.5.6: field values can be a plain-English description (string) OR a
+  // structured shape spec (nested object, e.g. {type: "array", items: {...}}).
+  // The Orchestrator's generate_lens SDK action produces both forms depending
+  // on how complex the field is. buildLensSystemPrompt handles both via its
+  // renderField helper — objects are rendered as JSON code blocks, strings as
+  // inline markdown bullets.
+  fields: Record<string, string | Record<string, unknown>>;
 }
 
 export interface ResearchPhase {
