@@ -590,14 +590,34 @@ async function main() {
       fail('render_lens does not consume pending meet sessions'); failed++;
     }
 
-    // l) attachLensToProject writes meetSessionId into lens.json on creation
+    // l) v0.6.5.7: attachLensToProject persists meetSessionId under its own key,
+    //    NOT as lens.json.sessionId. The meet sessionId can't be resumed in the
+    //    lens workspace cwd (different ~/.claude/projects/{hash}/ than the meet
+    //    cwd), so runLens must start a fresh session on first render. The meet
+    //    session is preserved as `meetSessionId` for provenance only; the
+    //    production sessionId gets written into `sessionId` after the first
+    //    successful run (lens-manager.ts:220).
     const attachStart = indexSource.indexOf('async attachLensToProject(');
     const attachEnd = indexSource.indexOf('// ─── Workflow Execution ───', attachStart);
     const attachBody = indexSource.slice(attachStart, attachEnd);
-    if (/lensWithSession\.sessionId = meetSessionId/.test(attachBody) && /JSON\.stringify\(lensWithSession/.test(attachBody)) {
-      pass('attachLensToProject persists meetSessionId into lens.json'); passed++;
+    if (/lensWithSession\.meetSessionId = meetSessionId/.test(attachBody) && /JSON\.stringify\(lensWithSession/.test(attachBody)) {
+      pass('v0.6.5.7: attachLensToProject persists meetSessionId under its own key'); passed++;
     } else {
-      fail('attachLensToProject does not persist meetSessionId'); failed++;
+      fail('v0.6.5.7: attachLensToProject does not persist meetSessionId under its own key'); failed++;
+    }
+
+    // l2) v0.6.5.7 regression guard: meetSessionId must NOT be written as sessionId
+    if (/lensWithSession\.sessionId = meetSessionId/.test(attachBody)) {
+      fail('v0.6.5.7 regression: writes meetSessionId as lens.json.sessionId; render will fail cross-cwd resume'); failed++;
+    } else {
+      pass('v0.6.5.7: does NOT write meetSessionId as lens.json.sessionId'); passed++;
+    }
+
+    // l3) v0.6.5.7: clears any stale sessionId before writing so re-renders are clean
+    if (/delete lensWithSession\.sessionId/.test(attachBody)) {
+      pass('v0.6.5.7: attachLensToProject clears stale sessionId before writing'); passed++;
+    } else {
+      fail('v0.6.5.7: attachLensToProject does not clear stale sessionId; re-render from a broken attempt will keep the bad session'); failed++;
     }
 
     // m) System prompt documents meet_lens verb (check for the action JSON example)

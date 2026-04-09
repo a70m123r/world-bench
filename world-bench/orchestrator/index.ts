@@ -360,15 +360,38 @@ export class Orchestrator {
 
     const lensDir = path.join(WORLD_BENCH_ROOT, 'projects', slug, 'lenses', lens.id);
 
-    // v0.6.4: if a meet session was provided, persist it into lens.json so
-    // lens-manager.runLens picks it up as resumeSessionId on the first run.
-    // This is the session-continuity bridge between meet_lens and render_lens.
-    // v0.6.5: also persist meetChannelId + meetThreadTs so the threadToSession
-    // map can be rebuilt by rehydrateLensSessions() after a restart (G5).
+    // v0.6.5.7: Do NOT write the meet sessionId as lens.json.sessionId, because
+    // lens-manager.runLens reads lens.json.sessionId and passes it as
+    // resumeSessionId to the SDK. The SDK resume feature is cwd-scoped — session
+    // jsonl files live under ~/.claude/projects/{cwd-hash}/ — and the meet runs
+    // at `worldBenchRoot` cwd while render runs at the newly-created lens
+    // workspace cwd. Different cwd hashes mean the render can't find the meet
+    // session file, and Claude Code fails with "No conversation found with
+    // session ID: ...". This was the v0.6.5.6 first-render failure on the
+    // Harvester at 2026-04-09 02:55.
+    //
+    // The meet session is preserved under a different key (`meetSessionId`) for
+    // provenance only. It's informational, not loadable as a resume target.
+    // runLens spawns the first production turn with a fresh session; the
+    // production session id is then written back into `lens.json.sessionId`
+    // (lens-manager.ts:220), and subsequent runs resume normally because they
+    // all share the same lens workspace cwd.
+    //
+    // The meet context is not lost — it was always intended to shape the brief
+    // (the lens config's systemPrompt + contracts), not to be resumed verbatim
+    // into production. The brief IS the persistent artifact. If a meet decision
+    // matters, it needs to be encoded in the brief before render.
+    //
+    // v0.6.5: meetChannelId + meetThreadTs continue to be persisted so
+    // rehydrateLensSessions can rebuild the threadToSession map after a restart.
     const lensWithSession: any = { ...lens };
+    // Explicitly clear any pre-existing sessionId from the lens config object
+    // (in case a re-render is happening and the old lens.json had a stale
+    // sessionId from a prior broken attempt).
+    delete lensWithSession.sessionId;
     if (meetSessionId) {
-      lensWithSession.sessionId = meetSessionId;
-      console.log(`[Orchestrator] Threading meet session into lens.json for ${slug}/${lens.id}: ${meetSessionId}`);
+      lensWithSession.meetSessionId = meetSessionId;
+      console.log(`[Orchestrator] Persisting meet session for ${slug}/${lens.id} as provenance (NOT as resume target): ${meetSessionId}`);
     }
     if (meetChannelId) lensWithSession.meetChannelId = meetChannelId;
     if (meetThreadTs) lensWithSession.meetThreadTs = meetThreadTs;
