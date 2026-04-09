@@ -38,6 +38,7 @@ export class Terminal {
       const text = event.text || '';
       const userId = event.user || '';
       const ts = event.ts;
+      const threadTs = (event as any).thread_ts;
 
       // Strip the @mention
       const cleanText = this.botUserId
@@ -46,13 +47,45 @@ export class Terminal {
 
       if (!cleanText) return;
 
-      console.log(`[Terminal] @mention from ${userId} in ${channelId}: ${cleanText}`);
+      console.log(`[Terminal] @mention from ${userId} in ${channelId}: ${cleanText} (thread=${threadTs || '(top)'})`);
+
+      // v0.6.5.5: if the @mention is inside a bound lens thread, route it to
+      // intervene/review mode via handleLensThreadOrchestratorMode, NOT through
+      // handleCommand. Previous v0.6.5.x double-dispatched: app_mention ran
+      // handleCommand (which posted an SDK response as a new top-level message)
+      // while app.message ALSO fired intervene for the same tag. One user message
+      // produced two Orchestrator actions. This fix gives app_mention exclusive
+      // ownership of tagged messages (thread-bound or not) and makes app.message
+      // skip tagged-in-thread cases.
+      if (threadTs && this.botUserId) {
+        const threadKey = `${channelId}:${threadTs}`;
+        const threadBinding = this.orchestrator.threadToSession?.get?.(threadKey);
+        if (threadBinding) {
+          // Same review detection as app.message routing block
+          const isReview = /^review\b/i.test(cleanText) && cleanText.length < 50;
+          console.log(`[Terminal] ${isReview ? 'Review' : 'Intervene'} mode (via app_mention): ${userId} → ${threadBinding.lensId} in thread ${threadKey}`);
+          try {
+            await this.orchestrator.handleLensThreadOrchestratorMode({
+              channelId,
+              threadTs,
+              binding: threadBinding,
+              mode: isReview ? 'review' : 'intervene',
+              message: cleanText,
+              triggerTs: ts,
+            });
+          } catch (error: any) {
+            console.error('[Terminal] app_mention thread-orchestrator-mode failed:', error);
+            await this.postToChannel(channelId, `:warning: ${isReview ? 'Review' : 'Intervene'} failed: ${error.message}`, threadTs);
+          }
+          return;
+        }
+      }
 
       const cmd: OrchestratorCommand = {
         raw: cleanText,
         intent: cleanText,
         channel_id: channelId,
-        thread_ts: (event as any).thread_ts,
+        thread_ts: threadTs,
         user_id: userId,
         ts,
       };
@@ -117,30 +150,19 @@ export class Terminal {
               });
             } catch (error: any) {
               console.error('[Terminal] Lens thread relay failed:', error);
-              await this.postToChannel(channelId, `:warning: Relay to ${threadBinding.lensId} failed: ${error.message}`);
+              await this.postToChannel(channelId, `:warning: Relay to ${threadBinding.lensId} failed: ${error.message}`, threadTs);
             }
             return;
           }
 
-          // INTERVENE / REVIEW MODE: @Orchestrator tagged in lens thread
-          const cleanedForOrc = text.replace(new RegExp(`<@${this.botUserId}(?:\\|[^>]*)?>`, 'g'), '').trim();
-          // Detect "review" trigger (Q11: short, parsable, no args required)
-          const isReview = /^review\b/i.test(cleanedForOrc) && cleanedForOrc.length < 50;
-
-          console.log(`[Terminal] ${isReview ? 'Review' : 'Intervene'} mode: ${userId} → ${threadBinding.lensId} in thread ${threadKey}`);
-          try {
-            await this.orchestrator.handleLensThreadOrchestratorMode({
-              channelId,
-              threadTs,
-              binding: threadBinding,
-              mode: isReview ? 'review' : 'intervene',
-              message: cleanedForOrc,
-              triggerTs: (message as any).ts,
-            });
-          } catch (error: any) {
-            console.error('[Terminal] Lens thread orchestrator-mode failed:', error);
-            await this.postToChannel(channelId, `:warning: ${isReview ? 'Review' : 'Intervene'} failed: ${error.message}`);
-          }
+          // v0.6.5.5: TAGGED in lens thread — defer to app_mention handler.
+          // Previous v0.6.5.x code fired intervene/review mode here, but app_mention
+          // ALSO fires for @mentions independently, producing double-dispatch:
+          // one intervene relay + one SDK-turn top-level response for the same user
+          // message. app_mention is now the exclusive owner of tagged messages
+          // (including tagged-in-bound-thread cases) and handles the intervene/review
+          // routing itself.
+          console.log(`[Terminal] Tagged in bound thread ${threadKey}, deferring to app_mention (no double-dispatch)`);
           return;
         }
         // No binding for this thread — log it so we know
