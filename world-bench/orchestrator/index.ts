@@ -847,18 +847,33 @@ export class Orchestrator {
       await this.terminal.removeThinkingReaction(args.channelId, args.triggerTs);
       if (result.status === 'failed') {
         const errMsg = result.error || result.output || 'unknown error';
-        await this.terminal.postToChannel(args.channelId, `:warning: Relay failed: ${errMsg}`);
+        // v0.6.5.4: thread failure post under the wave too
+        await this.terminal.postToChannel(args.channelId, `:warning: Relay failed: ${errMsg}`, args.threadTs);
         return;
       }
-      // Post the lens's response under its persona, in the same thread
+      // v0.6.5.4: post the lens's response under its persona AND THREADED UNDER
+      // the wave thread (args.threadTs). The previous v0.6.5.x code had the
+      // comment "in the same thread" but didn't actually pass thread_ts —
+      // resulting in the relay response landing as a NEW top-level message
+      // sibling of the wave instead of nested under it. Same threading discipline
+      // as the meet response chunks. Also chunked via splitForSlack so long
+      // continue_meet responses don't get truncated.
       const lens = this.loadLensFromDisk(args.binding.projectSlug, args.binding.lensId);
       const persona = lens?.slackPersona || { username: args.binding.lensId, icon_emoji: ':dna:' };
-      await this.terminal.postToChannelAs(args.channelId, persona,
-        result.output || '_(no response captured)_',
-      );
+      const rawOutput = result.output || '_(no response captured)_';
+      const chunks = splitForSlack(rawOutput);
+      console.log(`[Orchestrator] Posting ${chunks.length} chunk(s) of relay response (total ${rawOutput.length} chars) to thread ${args.threadTs}`);
+      for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i];
+        const labelled = chunks.length > 1
+          ? `${chunk}\n\n_(part ${i + 1}/${chunks.length})_`
+          : chunk;
+        await this.terminal.postToChannelAs(args.channelId, persona, labelled, args.threadTs);
+      }
     } catch (e: any) {
       await this.terminal.removeThinkingReaction(args.channelId, args.triggerTs);
-      await this.terminal.postToChannel(args.channelId, `:warning: Relay error: ${e.message}`);
+      // v0.6.5.4: thread error post too
+      await this.terminal.postToChannel(args.channelId, `:warning: Relay error: ${e.message}`, args.threadTs);
     }
   }
 
@@ -922,17 +937,27 @@ export class Orchestrator {
       await this.terminal.removeThinkingReaction(args.channelId, args.triggerTs);
       if (result.status === 'failed') {
         const errMsg = result.error || result.output || 'unknown error';
-        await this.terminal.postToChannel(args.channelId, `:warning: Intervene failed: ${errMsg}`);
+        // v0.6.5.4: thread failure post under the wave
+        await this.terminal.postToChannel(args.channelId, `:warning: Intervene failed: ${errMsg}`, args.threadTs);
         return;
       }
+      // v0.6.5.4: thread the intervene response under the wave + chunk it
       const lens = this.loadLensFromDisk(args.binding.projectSlug, args.binding.lensId);
       const persona = lens?.slackPersona || { username: args.binding.lensId, icon_emoji: ':dna:' };
-      await this.terminal.postToChannelAs(args.channelId, persona,
-        result.output || '_(no response captured)_',
-      );
+      const rawOutput = result.output || '_(no response captured)_';
+      const chunks = splitForSlack(rawOutput);
+      console.log(`[Orchestrator] Posting ${chunks.length} chunk(s) of intervene response (total ${rawOutput.length} chars) to thread ${args.threadTs}`);
+      for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i];
+        const labelled = chunks.length > 1
+          ? `${chunk}\n\n_(part ${i + 1}/${chunks.length})_`
+          : chunk;
+        await this.terminal.postToChannelAs(args.channelId, persona, labelled, args.threadTs);
+      }
     } catch (e: any) {
       await this.terminal.removeThinkingReaction(args.channelId, args.triggerTs);
-      await this.terminal.postToChannel(args.channelId, `:warning: ${args.mode} error: ${e.message}`);
+      // v0.6.5.4: thread error post under the wave too
+      await this.terminal.postToChannel(args.channelId, `:warning: ${args.mode} error: ${e.message}`, args.threadTs);
     }
   }
 
@@ -1271,14 +1296,24 @@ export class Orchestrator {
           if (result.status === 'failed') {
             // Use the structured error from continueMeet, or fall back to the output
             const errMsg = result.error || result.output || 'unknown error';
-            await this.terminal.postToChannel(replyTo, `:warning: continue_meet failed: ${errMsg}`);
+            // v0.6.5.4: thread the failure post under the conversation thread
+            await this.terminal.postToChannel(plan.channelId, `:warning: continue_meet failed: ${errMsg}`, plan.threadTs);
           } else {
-            // Post the lens's response under its persona in the same thread
+            // v0.6.5.4: post the lens's response under its persona AND threaded
+            // under the wave thread (plan.threadTs). Plus chunked via splitForSlack
+            // because long responses get truncated otherwise.
             const lens = this.loadLensFromDisk(plan.projectSlug, plan.lensId);
             const persona = lens?.slackPersona || { username: plan.lensId, icon_emoji: ':dna:' };
-            await this.terminal.postToChannelAs(plan.channelId, persona,
-              result.output || '_(no response captured)_',
-            );
+            const rawOutput = result.output || '_(no response captured)_';
+            const chunks = splitForSlack(rawOutput);
+            console.log(`[Orchestrator] Posting ${chunks.length} chunk(s) of continue_meet response (total ${rawOutput.length} chars) to thread ${plan.threadTs}`);
+            for (let i = 0; i < chunks.length; i++) {
+              const chunk = chunks[i];
+              const labelled = chunks.length > 1
+                ? `${chunk}\n\n_(part ${i + 1}/${chunks.length})_`
+                : chunk;
+              await this.terminal.postToChannelAs(plan.channelId, persona, labelled, plan.threadTs);
+            }
           }
         } catch (e: any) {
           await this.terminal.postToChannel(replyTo, `continue_meet failed: ${e.message}`);
