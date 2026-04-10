@@ -397,12 +397,33 @@ export class Orchestrator {
     if (meetThreadTs) lensWithSession.meetThreadTs = meetThreadTs;
 
     // Create lens directory structure
+    // v0.6.6 fix: preserve slack_channel_id + sessionId from existing lens.json
+    // on re-attach. Previous code overwrote lens.json entirely with the fresh
+    // action plan config, losing the channel ID (written on first attach) and
+    // the production sessionId (written after first successful run). This caused
+    // postToLensChannel to silently skip every post because getLensChannelId
+    // returned null. Lens channels appeared empty despite successful renders.
+    const lensJsonPath = path.join(lensDir, 'lens.json');
+    let existingChannelId: string | undefined;
+    let existingSessionId: string | undefined;
+    try {
+      if (fs.existsSync(lensJsonPath)) {
+        const existing = JSON.parse(fs.readFileSync(lensJsonPath, 'utf-8'));
+        existingChannelId = existing.slack_channel_id;
+        existingSessionId = existing.sessionId;
+      }
+    } catch { /* first attach — no existing file */ }
+
+    // Carry forward preserved fields
+    if (existingChannelId) (lensWithSession as any).slack_channel_id = existingChannelId;
+    if (existingSessionId && !lensWithSession.sessionId) lensWithSession.sessionId = existingSessionId;
+
     try {
       fs.mkdirSync(path.join(lensDir, 'memory'), { recursive: true });
       fs.mkdirSync(path.join(lensDir, 'workspace'), { recursive: true });
       fs.mkdirSync(path.join(lensDir, 'output'), { recursive: true });
       fs.writeFileSync(
-        path.join(lensDir, 'lens.json'),
+        lensJsonPath,
         JSON.stringify(lensWithSession, null, 2),
       );
     } catch (error: any) {
@@ -410,23 +431,24 @@ export class Orchestrator {
       throw error;
     }
 
-    // Create lens Slack channel
-    let lensChannelId: string | undefined;
-    try {
-      lensChannelId = await this.terminal.createChannel(
-        `wb-lens-${lens.id}`,
-        `Lens: ${lens.name} — ${lens.purpose}`,
-      ) || undefined;
-    } catch (error: any) {
-      console.error(`[Orchestrator] Lens channel creation failed: ${error.message}`);
-      // Roll back the lens directory only — don't touch the project
-      fs.rmSync(lensDir, { recursive: true, force: true });
-      throw error;
+    // Create lens Slack channel (skip if already exists from prior attach)
+    let lensChannelId: string | undefined = existingChannelId;
+    if (!lensChannelId) {
+      try {
+        lensChannelId = await this.terminal.createChannel(
+          `wb-lens-${lens.id}`,
+          `Lens: ${lens.name} — ${lens.purpose}`,
+        ) || undefined;
+      } catch (error: any) {
+        console.error(`[Orchestrator] Lens channel creation failed: ${error.message}`);
+        // Roll back the lens directory only — don't touch the project
+        fs.rmSync(lensDir, { recursive: true, force: true });
+        throw error;
+      }
     }
 
-    // Update lens.json with channel ID
-    if (lensChannelId) {
-      const lensJsonPath = path.join(lensDir, 'lens.json');
+    // Update lens.json with channel ID (first attach or if somehow missing)
+    if (lensChannelId && !(lensWithSession as any).slack_channel_id) {
       const lensData = JSON.parse(fs.readFileSync(lensJsonPath, 'utf-8'));
       lensData.slack_channel_id = lensChannelId;
       fs.writeFileSync(lensJsonPath, JSON.stringify(lensData, null, 2));
