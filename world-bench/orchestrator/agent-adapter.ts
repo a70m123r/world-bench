@@ -223,6 +223,26 @@ export class ClaudeAgentAdapter implements AgentAdapter {
     const permissionManager: PermissionManager | undefined = context.permissionManager;
     const lensConfig: LensConfig | undefined = context.lensConfig;
 
+    // v0.6.6: lens channel streaming context. Threaded from
+    // render_lens → executeRun → runLens → baseContext → here.
+    const terminal: any = context.terminal;  // Terminal instance (any to avoid circular import)
+    const lensId: string = context.lensId || '';
+    const verbose: boolean = context.verbose || false;
+
+    // Helper: post to lens channel (non-critical — swallows errors)
+    const streamToLens = async (text: string): Promise<void> => {
+      if (!terminal || !lensId || !lensConfig || !projectSlug) return;
+      try {
+        await terminal.postToLensChannel(projectSlug, lensId, lensConfig, text);
+      } catch { /* non-critical — don't crash the lens for a Slack post */ }
+    };
+
+    // Rate-limit state for verbose mode: batch consecutive same-tool calls
+    // within a 2-second window to stay under Slack's ~1 msg/sec limit.
+    let lastStreamedTool = '';
+    let lastStreamedTime = 0;
+    let batchedCount = 0;
+
     // v0.6.5.8: prefix matching for denied tools. Entries ending in '*' are
     // treated as prefix matches (e.g. 'mcp__plugin_slack_slack__*' blocks
     // every tool whose name starts with 'mcp__plugin_slack_slack__'). Exact
@@ -251,8 +271,11 @@ export class ClaudeAgentAdapter implements AgentAdapter {
             return { hookEventName: 'PreToolUse', permissionDecision: 'defer' };
           }
 
-          // Tool is denied — run the elevation loop
-          console.log(`[AgentAdapter] Denied tool requested: ${toolName} by ${lensName}`);
+          // v0.6.6: Tool is in denied list — run elevation loop (advisory only
+          // under bypassPermissions; the SDK ignores the deny decision and runs
+          // the tool anyway. Labels renamed from DENIED→AUDIT per council decision
+          // 2026-04-10 to reflect that this is observability, not enforcement.)
+          console.log(`[AgentAdapter] AUDIT: tool not in allowed set: ${toolName} by ${lensName}`);
 
           if (permissionManager && lensConfig && runId && projectSlug) {
             const evaluation = permissionManager.evaluateElevation(lensConfig, toolName);
@@ -273,13 +296,15 @@ export class ClaudeAgentAdapter implements AgentAdapter {
 
             if (evaluation.decision === 'escalate') {
               // Ambiguous — log escalation event for Pav to review
-              console.log(`[AgentAdapter] ESCALATE: ${toolName} for ${lensName} — ${evaluation.reason}`);
+              console.log(`[AgentAdapter] AUDIT/ESCALATE (advisory): ${toolName} for ${lensName} — ${evaluation.reason}`);
               const event = createEvent(
                 runId, lensName, 'elevation_request',
                 `Needs Pav: ${evaluation.reason}`,
                 { tool: toolName, lens_name: lensName, decision: 'escalate', reason: evaluation.reason },
               );
               try { appendEvent(projectSlug, runId, event); } catch { }
+              // v0.6.6: stream escalation to lens channel (always, not just verbose)
+              await streamToLens(`:lock: AUDIT/ESCALATE: \`${toolName}\` — ${evaluation.reason.slice(0, 200)}`);
               // Deny for now — Pav can grant later
               return {
                 hookEventName: 'PreToolUse',
@@ -288,8 +313,8 @@ export class ClaudeAgentAdapter implements AgentAdapter {
               };
             }
 
-            // Explicit deny
-            console.log(`[AgentAdapter] DENIED: ${toolName} for ${lensName} — ${evaluation.reason}`);
+            // Explicit deny (advisory under bypassPermissions)
+            console.log(`[AgentAdapter] AUDIT/DENIED (advisory): ${toolName} for ${lensName} — ${evaluation.reason}`);
             permissionManager.denyTool(lensConfig, toolName, projectSlug, runId, 'orchestrator', evaluation.reason);
           }
 
@@ -305,17 +330,40 @@ export class ClaudeAgentAdapter implements AgentAdapter {
       PostToolUse: [{
         hooks: [async (input: any) => {
           if (runId && projectSlug) {
+            const toolName = input.tool_name || '';
             const event = createEvent(
               runId, lensName, 'message',
-              `Tool: ${input.tool_name}`,
+              `Tool: ${toolName}`,
               {
-                tool: input.tool_name,
+                tool: toolName,
                 tool_input: truncateForLog(input.tool_input),
               },
             );
             try {
               appendEvent(projectSlug, runId, event);
             } catch { /* non-critical — don't crash the lens */ }
+
+            // v0.6.6: verbose mode streams every tool call to lens channel
+            if (verbose) {
+              const now = Date.now();
+              const truncInput = typeof input.tool_input === 'string'
+                ? input.tool_input.slice(0, 80)
+                : JSON.stringify(input.tool_input || '').slice(0, 80);
+
+              // Rate-limit: batch consecutive same-tool calls within 2s window
+              if (toolName === lastStreamedTool && (now - lastStreamedTime) < 2000) {
+                batchedCount++;
+              } else {
+                // Flush any batched count from previous tool
+                if (batchedCount > 0) {
+                  await streamToLens(`:wrench: \`${lastStreamedTool}\`: _(${batchedCount} more call${batchedCount > 1 ? 's' : ''} batched)_`);
+                  batchedCount = 0;
+                }
+                await streamToLens(`:wrench: \`${toolName}\`: ${truncInput}`);
+                lastStreamedTool = toolName;
+                lastStreamedTime = now;
+              }
+            }
           }
           return { hookEventName: 'PostToolUse' };
         }],
@@ -338,6 +386,8 @@ export class ClaudeAgentAdapter implements AgentAdapter {
               appendEvent(projectSlug, runId, event);
             } catch { /* non-critical */ }
           }
+          // v0.6.6: always stream errors to lens channel (exception-only default)
+          await streamToLens(`:x: Tool failed: \`${input.tool_name}\` — ${(input.error || '').toString().slice(0, 200)}`);
           return { hookEventName: 'PostToolUseFailure' };
         }],
       }],

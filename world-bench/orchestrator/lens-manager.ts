@@ -70,6 +70,10 @@ export class LensManager {
     taskPrompt: string,
     priorLensOutput?: string,
     feedback?: string,
+    // v0.6.6: streaming context threads terminal + verbose flag into the
+    // SDK hooks so PostToolUse/PostToolUseFailure can post to the lens
+    // channel in real time. `any` for terminal to avoid circular import.
+    streamingContext?: { terminal: any; lensId: string; verbose: boolean },
   ): Promise<LensRunResult> {
     const allEvents: WorkflowEvent[] = [];
     let researchResult: AgentResult | undefined;
@@ -124,6 +128,12 @@ export class LensManager {
       // implementation legitimately need more than 10 turns. The per-lens
       // maxTurns override in lens.json takes precedence if present.
       maxTurns: (lens as any).maxTurns || 30,
+      // v0.6.6: lens channel streaming context (threaded from executeRun)
+      ...(streamingContext ? {
+        terminal: streamingContext.terminal,
+        lensId: streamingContext.lensId,
+        verbose: streamingContext.verbose,
+      } : {}),
     };
 
     // Pass MCP servers to lens if it needs MCP tools

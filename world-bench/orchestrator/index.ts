@@ -459,6 +459,8 @@ export class Orchestrator {
     lensConfigs: LensConfig[],
     taskPrompt: string,
     feedback?: string,
+    // v0.6.6: options for lens channel streaming and post-run audit
+    options?: { verbose?: boolean },
   ): Promise<{ runId: string; results: LensRunResult[]; summary: string }> {
     const runId = uuid();
 
@@ -474,7 +476,15 @@ export class Orchestrator {
     let priorOutput: string | undefined;
 
     // Sequential execution — one lens at a time (Claude Max rate limits)
+    const verbose = options?.verbose ?? false;
+
     for (const lens of lensConfigs) {
+      // v0.6.6: post start message to lens channel
+      await this.terminal.postToLensChannel(
+        projectSlug, lens.id, lens,
+        `:satellite_antenna: **${lens.name}** run started — run \`${runId.slice(0, 8)}\``,
+      );
+
       await this.terminal.postAsLens(
         lens,
         projectSlug,
@@ -483,6 +493,8 @@ export class Orchestrator {
 
       const result = await this.lensManager.runLens(
         lens, projectSlug, runId, taskPrompt, priorOutput, feedback,
+        // v0.6.6: thread terminal + verbose into the SDK hooks
+        { terminal: this.terminal, lensId: lens.id, verbose },
       );
       results.push(result);
 
@@ -499,6 +511,10 @@ export class Orchestrator {
       for (const chunk of splitForSlack(rawOutput)) {
         await this.terminal.postToLensChannel(projectSlug, lens.id, lens, chunk);
       }
+
+      // v0.6.6: post structured run audit to lens channel
+      const audit = this.buildRunAudit(projectSlug, runId, lens.name, lens.id);
+      await this.terminal.postToLensChannel(projectSlug, lens.id, lens, audit);
 
       // Project channel gets a human-readable summary
       await this.terminal.postAsLens(
@@ -563,8 +579,17 @@ export class Orchestrator {
       }
     }
 
+    // v0.6.6: inline per-lens audit in the project channel summary
+    if (projectSlug && runId) {
+      for (const r of results) {
+        const audit = this.buildRunAudit(projectSlug, runId, r.lens.name, r.lens.id);
+        lines.push('');
+        lines.push(audit);
+      }
+    }
+
     lines.push('');
-    lines.push('_Full output in each lens channel. Dive in for details._');
+    lines.push('_Full trace in each lens channel._');
 
     return lines.join('\n');
   }
@@ -617,6 +642,122 @@ export class Orchestrator {
     } catch {
       return undefined;
     }
+  }
+
+  /**
+   * v0.6.6: build a structured audit summary from events.jsonl for a completed
+   * lens run. Posted to both the lens channel (full detail) and the project
+   * channel (via buildRunSummary). Council decision 2026-04-10: Pav wants to
+   * see timing, tools used, escalation count, errors, and output stats — the
+   * HOW, not just the WHAT.
+   */
+  private buildRunAudit(projectSlug: string, runId: string, lensName: string, lensId: string): string {
+    const eventsPath = path.join(
+      WORLD_BENCH_ROOT, 'projects', projectSlug, 'runs', runId, 'events.jsonl',
+    );
+
+    const toolCounts: Record<string, number> = {};
+    let escalationCount = 0;
+    let errorCount = 0;
+    let startTime: string | undefined;
+    let endTime: string | undefined;
+    let researchEndTime: string | undefined;
+
+    try {
+      if (!fs.existsSync(eventsPath)) return `:satellite_antenna: **${lensName}** run audit — no events recorded`;
+      const raw = fs.readFileSync(eventsPath, 'utf-8');
+      const lines = raw.trim().split('\n').filter(Boolean);
+
+      for (const line of lines) {
+        try {
+          const event = JSON.parse(line);
+          if (!startTime) startTime = event.timestamp;
+          endTime = event.timestamp;
+
+          // Detect research→production boundary
+          if (event.type === 'state_change' && /research.done|producing/i.test(event.content || '')) {
+            if (!researchEndTime) researchEndTime = event.timestamp;
+          }
+
+          // Count tools for this lens
+          if (event.actor === lensName && event.type === 'message' && event.metadata?.tool) {
+            const tool = event.metadata.tool;
+            toolCounts[tool] = (toolCounts[tool] || 0) + 1;
+          }
+
+          if (event.type === 'elevation_request') escalationCount++;
+          if (event.type === 'error') errorCount++;
+        } catch { /* skip malformed */ }
+      }
+    } catch {
+      return `:satellite_antenna: **${lensName}** run audit — events.jsonl unreadable`;
+    }
+
+    // Format timing
+    const dur = (s?: string, e?: string): string => {
+      if (!s || !e) return '—';
+      const ms = new Date(e).getTime() - new Date(s).getTime();
+      const m = Math.floor(ms / 60000);
+      const sec = Math.floor((ms % 60000) / 1000);
+      return m > 0 ? `${m}m ${sec}s` : `${sec}s`;
+    };
+
+    const totalTime = dur(startTime, endTime);
+    const researchTime = researchEndTime ? dur(startTime, researchEndTime) : undefined;
+    const productionTime = researchEndTime ? dur(researchEndTime, endTime) : undefined;
+    const timingStr = researchTime && productionTime
+      ? `${totalTime} (research ${researchTime} + production ${productionTime})`
+      : totalTime;
+
+    // Format tools: sorted by count descending
+    const toolStr = Object.entries(toolCounts)
+      .sort((a, b) => b[1] - a[1])
+      .map(([t, c]) => `${t} x${c}`)
+      .join(', ') || 'none';
+
+    // Check output file
+    let outputStr = '—';
+    try {
+      const outputFile = path.join(
+        WORLD_BENCH_ROOT, 'projects', projectSlug, 'lenses', lensId, 'output', `${runId}.json`,
+      );
+      if (fs.existsSync(outputFile)) {
+        const sizeKB = Math.round(fs.statSync(outputFile).size / 1024);
+        outputStr = `${runId.slice(0, 8)}.json — ${sizeKB}KB`;
+      }
+    } catch { /* best effort */ }
+
+    // Check for harvest-specific output
+    try {
+      const harvestFile = path.join(
+        WORLD_BENCH_ROOT, 'projects', projectSlug, 'lenses', lensId, 'output', 'harvest.json',
+      );
+      if (fs.existsSync(harvestFile)) {
+        const sizeKB = Math.round(fs.statSync(harvestFile).size / 1024);
+        try {
+          const data = JSON.parse(fs.readFileSync(harvestFile, 'utf-8'));
+          const msgCount = data.messages?.length || '?';
+          outputStr += ` + harvest.json — ${msgCount} msgs, ${sizeKB}KB`;
+        } catch {
+          outputStr += ` + harvest.json — ${sizeKB}KB`;
+        }
+      }
+    } catch { /* best effort */ }
+
+    const errorStr = errorCount === 0 ? '0' : `${errorCount}`;
+    const escStr = escalationCount === 0
+      ? '0'
+      : `${escalationCount} (all advisory — bypassPermissions mode)`;
+
+    const out: string[] = [];
+    out.push(`:satellite_antenna: **${lensName}** run audit\n`);
+    out.push(`**Timing:**      ${timingStr}`);
+    out.push(`**Tools used:**  ${toolStr}`);
+    out.push(`**Escalations:** ${escStr}`);
+    out.push(`**Errors:**      ${errorStr}`);
+    out.push(`**Output:**      ${outputStr}`);
+
+    return out.join('\n');
   }
 
   // ─── Lens Resume ───
@@ -1444,11 +1585,13 @@ export class Orchestrator {
           // v0.6.5: pass meet thread routing keys through so they get persisted
           // into lens.json for rehydration after a restart
           await this.attachLensToProject(plan.projectSlug, lens, meetSessionId, meetChannelId, meetThreadTs);
-          // Run just this one lens
+          // Run just this one lens (v0.6.6: pass verbose flag from action plan)
           const { summary } = await this.executeRun(
             plan.projectSlug,
             [lens],
             plan.taskPrompt || `Run lens ${lens.name}.`,
+            undefined,
+            { verbose: plan.verbose ?? false },
           );
           await this.terminal.postToChannel(replyTo,
             `Done. Lens \`${lens.id}\` rendered. Check \`#wb-proj-${plan.projectSlug}\` for results. Pav reviews before next lens proposal.`,
