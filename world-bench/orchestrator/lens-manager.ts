@@ -323,19 +323,25 @@ export class LensManager {
     continuationMessage?: string,
     sessionId?: string,
     speaker?: string,
+    // v0.6.9: 'conversation' mode — post-render lens channel chat. The lens
+    // has been rendered, has a brief + production history. This is NOT a
+    // pre-render introduction meeting. The message is from Pav (or Orchestrator)
+    // talking to the lens in its channel.
+    mode?: 'preflight' | 'continuation' | 'conversation',
   ): Promise<{ output: string; sessionId?: string; status: 'completed' | 'failed' }> {
-    // v0.6.5: Reject mixed states hard. Either both continuationMessage AND sessionId
-    // are provided (continuation mode), or neither is (preflight mode). No silent
-    // degradation. Council direction: "silent resume-drop must become a hard error,
-    // not a silent discard." (Claw + Soren, v0.6.5 escalation thread)
-    const isContinuation = !!continuationMessage || !!sessionId;
-    if (isContinuation && (!continuationMessage || !sessionId)) {
+    // v0.6.5: Reject mixed states hard for continuation mode.
+    // v0.6.9: 'conversation' mode bypasses this check — it has a message but
+    // intentionally no sessionId (fresh conversation with an already-rendered lens).
+    const effectiveMode = mode || (continuationMessage && sessionId ? 'continuation' : continuationMessage ? 'conversation' : 'preflight');
+
+    if (effectiveMode === 'continuation' && (!continuationMessage || !sessionId)) {
       throw new Error(
         `runLensMeet continuation mode requires BOTH continuationMessage AND sessionId. ` +
         `Got: continuationMessage=${!!continuationMessage}, sessionId=${!!sessionId}. ` +
         `This is the v0.6.5 hard-fail contract — silent param drops are forbidden.`,
       );
     }
+    const isContinuation = effectiveMode === 'continuation';
 
     // Strip all mutation tools from the lens's tool list — meeting is read-only.
     // The lens still has Read/Glob/Grep/WebSearch/WebFetch (if those were in its
@@ -360,14 +366,9 @@ Do NOT begin work. Do NOT write any files. Do NOT run a research harvest. This i
 
 If everything looks good and you have no questions, say so explicitly. Silence is not consent.`;
 
-    // v0.6.5: build the user message based on mode
+    // Build the user message based on mode
     let meetPrompt: string;
-    if (isContinuation) {
-      // Continuation mode: format the message with explicit speaker provenance.
-      // This is the speaker attribution invariant — the lens always knows who's
-      // talking. Council: "every continue_meet call carries explicit speaker
-      // provenance. Mediated lens input is quoted artifact, not hidden side-channel
-      // memory." (Claw, v0.6.5 escalation)
+    if (effectiveMode === 'continuation') {
       const speakerLabel = speaker || 'pav';
       meetPrompt = `CONVERSATION CONTINUES — you've been here before. Read this new turn from the conversation and respond.
 
@@ -375,6 +376,22 @@ From ${speakerLabel}:
 ${continuationMessage}
 
 Respond directly to what you just read. You can ask clarifying questions, push back, suggest amendments, or proceed with what they're asking. You still have not been rendered for production work — this is still the meeting phase. If they're asking you to do production work, tell them you're still in meeting mode and need to be explicitly rendered.`;
+    } else if (effectiveMode === 'conversation') {
+      // v0.6.9: post-render lens channel conversation. The lens has been rendered
+      // and has production experience. This is Pav (or the Orchestrator) talking
+      // to it in its channel — not a pre-render introduction.
+      meetPrompt = `You are in your lens channel. You have been rendered and have completed production runs. Someone is talking to you. Read the context block (if present) to understand your current state, then respond naturally.
+
+${continuationMessage}
+
+You can:
+- Answer questions about your work, output, or approach
+- Discuss your contracts and how they're holding up
+- Suggest improvements to your own config or implementation
+- Read files in your workspace if you need to check something
+- Write notes to memory/scratchpad.md for your future self
+
+Respond directly and conversationally. You are an architect and maintainer of your lens, not a script runner.`;
     } else {
       meetPrompt = defaultIntro;
     }

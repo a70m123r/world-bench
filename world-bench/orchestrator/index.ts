@@ -1197,10 +1197,10 @@ export class Orchestrator {
           true, args.channelId, args.triggerTs,
         );
       } else {
-        // No session — spawn a fresh meet with context + user's message
-        console.log(`[Orchestrator] Lens channel fresh meet: ${args.lensId} (no session, spawning new with context)`);
+        // No session — spawn a fresh conversation with context + user's message
+        console.log(`[Orchestrator] Lens channel conversation: ${args.lensId} (no session, spawning new with context)`);
         result = await this.lensManager.runLensMeet(
-          lens, enrichedMessage, undefined, args.speaker,
+          lens, enrichedMessage, undefined, args.speaker, 'conversation',
         );
 
         // Capture the new sessionId so future messages can continue

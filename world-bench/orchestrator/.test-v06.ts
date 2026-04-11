@@ -656,8 +656,8 @@ async function main() {
       fail('runLensMeet signature missing continuation parameters'); failed++;
     }
 
-    // b) Hard-fail: rejects mixed states (sessionId without continuationMessage or vice versa)
-    if (/isContinuation && \(!continuationMessage \|\| !sessionId\)/.test(lensManagerSource)) {
+    // b) Hard-fail: rejects mixed states in continuation mode (v0.6.9: 'conversation' mode is valid with message + no sessionId)
+    if (/effectiveMode === 'continuation' && \(!continuationMessage \|\| !sessionId\)/.test(lensManagerSource)) {
       pass('runLensMeet rejects mixed continuation states (hard-fail contract)'); passed++;
     } else {
       fail('runLensMeet does not reject mixed continuation states'); failed++;
