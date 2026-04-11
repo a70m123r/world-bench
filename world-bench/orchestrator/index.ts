@@ -1767,6 +1767,19 @@ export class Orchestrator {
           if (!this.projectExists(plan.projectSlug)) {
             await this.bootstrapProject(plan.projectName || plan.projectSlug, plan.projectSlug);
           }
+
+          // v0.6.9: skip attachLensToProject if the lens already exists on disk.
+          // attachLensToProject was designed for FIRST attach — it creates dirs,
+          // creates the Slack channel, writes lens.json. On re-renders it overwrites
+          // lens.json with a fresh config from the action plan, clobbering runtime
+          // state (slack_channel_id, sessionId, maturity, maturityLog). The
+          // preservation logic (v0.6.6.1) tries to carry forward these fields but
+          // fails when prior renders already lost them (chain-clobber). The clean
+          // fix: only attach on first render. Re-renders use the existing lens.json.
+          const lensJsonExists = fs.existsSync(
+            path.join(WORLD_BENCH_ROOT, 'projects', plan.projectSlug, 'lenses', lens.id, 'lens.json'),
+          );
+
           // v0.6.4 + v0.6.5: consume any pending meet session for this lens
           const meetKey = `${plan.projectSlug}:${lens.id}`;
           const pendingMeet = this.pendingMeetSessions.get(meetKey);
@@ -1777,9 +1790,15 @@ export class Orchestrator {
             this.pendingMeetSessions.delete(meetKey);
             console.log(`[Orchestrator] Consuming meet session for ${meetKey}: ${meetSessionId}`);
           }
-          // v0.6.5: pass meet thread routing keys through so they get persisted
-          // into lens.json for rehydration after a restart
-          await this.attachLensToProject(plan.projectSlug, lens, meetSessionId, meetChannelId, meetThreadTs);
+          // v0.6.9: only attach on FIRST render. Re-renders skip attachLensToProject
+          // entirely — the lens already has its dirs, channel, and lens.json with
+          // runtime state (slack_channel_id, sessionId, maturity, maturityLog) that
+          // would be clobbered by a fresh attach. Config changes go through amend_lens.
+          if (!lensJsonExists) {
+            await this.attachLensToProject(plan.projectSlug, lens, meetSessionId, meetChannelId, meetThreadTs);
+          } else {
+            console.log(`[Orchestrator] Lens ${lens.id} already attached — skipping attachLensToProject (runtime state preserved)`);
+          }
           // Run just this one lens (v0.6.6: pass verbose flag from action plan)
           const { summary } = await this.executeRun(
             plan.projectSlug,

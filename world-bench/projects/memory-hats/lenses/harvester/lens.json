@@ -90,12 +90,12 @@
       "from": "discovery",
       "to": "settling",
       "reason": "first successful render",
-      "evidence": "run d6e7fa7e completed, output contract met",
+      "evidence": "run 959e4761 completed, output contract met",
       "triggeredBy": "automatic",
-      "timestamp": "2026-04-11T16:40:47.782Z",
-      "runId": "d6e7fa7e-51d3-4094-bb2c-aa1f342ee7df"
+      "timestamp": "2026-04-11T23:20:46.315Z",
+      "runId": "959e4761-fbcd-4c0a-bd78-92e3e0b0b0f9"
     }
   ],
-  "activePromptVersion": 2,
+  "activePromptVersion": 4,
   "slack_channel_id": "C0ARUMPDYSY"
 }
