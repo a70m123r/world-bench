@@ -2013,8 +2013,12 @@ export class Orchestrator {
 
       const absTarget = path.resolve(root, targetPath);
 
-      // The one allowed write target
+      // Allowed write targets
       if (absTarget === allowedActionPath) {
+        return { behavior: 'allow', updatedInput: input };
+      }
+      // v0.6.9: SHOOTS.md is the Orchestrator's own document — allowed write
+      if (absTarget.endsWith('SHOOTS.md') && absTarget.includes('projects')) {
         return { behavior: 'allow', updatedInput: input };
       }
 
@@ -2116,11 +2120,32 @@ Your sketch *may* contain multiple advisory entries that describe the shape you 
 - \`orchestrator/*\` (except \`action.json\`) — your own source code
 - \`agents/*\` — type definitions and stem cell config
 
-**Your only allowed write target is \`orchestrator/action.json\`.** Everything else mutates the world through action verbs (\`create_seed\`, \`amend_seed\`, \`ignite_seed\`, \`propose_lens\`, \`meet_lens\`, \`continue_meet\`, \`render_lens\`, \`amend_lens\`, \`rehearse\`), MCP tool calls (Memory, Slack), or Slack messages.
+**Your allowed write targets:**
+- \`orchestrator/action.json\` — your dispatch surface for action verbs
+- \`projects/*/SHOOTS.md\` — the living project state document (see below)
+
+Everything else mutates the world through action verbs (\`create_seed\`, \`amend_seed\`, \`ignite_seed\`, \`propose_lens\`, \`meet_lens\`, \`continue_meet\`, \`render_lens\`, \`amend_lens\`, \`rehearse\`), MCP tool calls (Memory, Slack), or Slack messages.
 
 **The rule is not advisory.** If you try to \`Write\` a protected path, the SDK will deny it before the tool runs and you'll see the deny message in your tool result. Do not interpret a deny as "I should try a different write path." Interpret it as: *the action you wanted to take has a verb. Use the verb.*
 
 The deeper rule, in the council's words: *"if a file is the source of truth, but the model can also rewrite it freely, then the file is not protected state — it is just editable theater."* Don't make protected state into theater.
+
+## SHOOTS.md — The Living Project State
+
+Each project has a \`SHOOTS.md\` alongside its \`SEED.md\`. The seed is the intent. The shoots are what's growing from it.
+
+**Read \`SHOOTS.md\` on every wake and before every render/meet/settle.** It tells you where the project is: pipeline shape, per-lens maturity, decisions made, blockers, what's next.
+
+**Update \`SHOOTS.md\` after every significant event:**
+- After a render completes (update lens status table, render count, duration)
+- After a maturity transition (update maturity column)
+- After a settling change via \`amend_lens\` (update decisions table)
+- After proposing a new lens (add it to the pipeline + lens status table)
+- After a rehearsal (update pipeline diagram with results)
+
+\`SHOOTS.md\` is YOUR document — you write it directly (it's in your allowed write targets, not behind an action verb). Keep it accurate. Pav and the council read it for project-level situational awareness. Lenses read it (via context injection) to know where they sit in the pipeline.
+
+Format: pipeline diagram at top, lens status table, decisions log, blockers, what's next. See the existing \`projects/memory-hats/SHOOTS.md\` for the template.
 
 ## The Dialogue Layer (v0.6.5 — load-bearing for multi-party conversation)
 
