@@ -21,6 +21,10 @@ import { LensManager, LensRunResult } from './lens-manager';
 import { Terminal } from './terminal';
 import { ContextProvider } from './context-provider';
 import { SeedManager, NoIgnitedSeedError, SeedNotYetApprovedError } from './seed-manager';
+import {
+  transitionMaturity, getMaturity, countConsecutiveCleanRenders,
+  savePromptVersion, countWastedTurns,
+} from './maturity';
 
 // Load env from orchestrator config dir
 dotenv.config({ path: path.join(__dirname, 'config', '.env'), override: true });
@@ -406,17 +410,31 @@ export class Orchestrator {
     const lensJsonPath = path.join(lensDir, 'lens.json');
     let existingChannelId: string | undefined;
     let existingSessionId: string | undefined;
+    let existingMaturity: string | undefined;
+    let existingMaturityLog: any[] | undefined;
+    let existingPromptVersion: number | undefined;
     try {
       if (fs.existsSync(lensJsonPath)) {
         const existing = JSON.parse(fs.readFileSync(lensJsonPath, 'utf-8'));
         existingChannelId = existing.slack_channel_id;
         existingSessionId = existing.sessionId;
+        existingMaturity = existing.maturity;
+        existingMaturityLog = existing.maturityLog;
+        existingPromptVersion = existing.activePromptVersion;
       }
     } catch { /* first attach — no existing file */ }
 
     // Carry forward preserved fields
     if (existingChannelId) (lensWithSession as any).slack_channel_id = existingChannelId;
     if (existingSessionId && !lensWithSession.sessionId) lensWithSession.sessionId = existingSessionId;
+    // v0.6.7: preserve maturity state + log across re-attach
+    if (existingMaturity) (lensWithSession as any).maturity = existingMaturity;
+    if (existingMaturityLog) (lensWithSession as any).maturityLog = existingMaturityLog;
+    if (existingPromptVersion) (lensWithSession as any).activePromptVersion = existingPromptVersion;
+    // Set initial maturity if this is first attach
+    if (!existingMaturity && !(lensWithSession as any).maturity) {
+      (lensWithSession as any).maturity = 'discovery';
+    }
 
     try {
       fs.mkdirSync(path.join(lensDir, 'memory'), { recursive: true });
@@ -537,6 +555,48 @@ export class Orchestrator {
       // v0.6.6: post structured run audit to lens channel
       const audit = this.buildRunAudit(projectSlug, runId, lens.name, lens.id);
       await this.terminal.postToLensChannel(projectSlug, lens.id, lens, audit);
+
+      // v0.6.7: maturity transitions based on run outcome
+      const currentMaturity = getMaturity(projectSlug, lens.id);
+      if (status === 'completed') {
+        if (currentMaturity === 'discovery' || currentMaturity === 'first-cut') {
+          // First successful render → advance to settling
+          transitionMaturity(projectSlug, lens.id, 'settling', 'first successful render', 'automatic', {
+            evidence: `run ${runId.slice(0, 8)} completed, output contract met`,
+            runId,
+          });
+          // Save first prompt version if none exists
+          savePromptVersion(projectSlug, lens.id, lens, 'initial config at first success', 'orchestrator');
+        } else if (currentMaturity === 'settling') {
+          // Check if we should advance to steady (2+ clean renders, no wasted turns)
+          const wastedTurns = countWastedTurns(projectSlug, runId, lens.name, currentMaturity);
+          if (wastedTurns === 0) {
+            const cleanCount = countConsecutiveCleanRenders(projectSlug, lens.id) + 1;
+            // Log the clean render even if we don't advance
+            transitionMaturity(projectSlug, lens.id,
+              cleanCount >= 2 ? 'steady' : 'settling',
+              cleanCount >= 2
+                ? `${cleanCount} consecutive clean renders, no wasted turns — advancing to steady`
+                : `clean render ${cleanCount}/2 — config stable`,
+              'automatic',
+              { evidence: `run ${runId.slice(0, 8)}: ${wastedTurns} wasted turns`, runId },
+            );
+          } else {
+            // Wasted turns — stay at settling, log why
+            transitionMaturity(projectSlug, lens.id, 'settling',
+              `settling: ${wastedTurns} wasted turn(s) detected`, 'automatic',
+              { evidence: `run ${runId.slice(0, 8)}: needs config refinement`, runId },
+            );
+          }
+        }
+        // steady + completed = no transition needed
+      } else if (status === 'failed' && currentMaturity === 'steady') {
+        // Regression: steady → settling on structural failure
+        transitionMaturity(projectSlug, lens.id, 'settling',
+          'regression: render failed in steady state', 'automatic',
+          { evidence: `run ${runId.slice(0, 8)} failed`, runId },
+        );
+      }
 
       // Project channel gets a human-readable summary
       await this.terminal.postAsLens(
@@ -771,6 +831,9 @@ export class Orchestrator {
       ? '0'
       : `${escalationCount} (all advisory — bypassPermissions mode)`;
 
+    // v0.6.7: include maturity in audit
+    const maturity = getMaturity(projectSlug, lensId);
+
     const out: string[] = [];
     out.push(`:satellite_antenna: **${lensName}** run audit\n`);
     out.push(`**Timing:**      ${timingStr}`);
@@ -778,6 +841,7 @@ export class Orchestrator {
     out.push(`**Escalations:** ${escStr}`);
     out.push(`**Errors:**      ${errorStr}`);
     out.push(`**Output:**      ${outputStr}`);
+    out.push(`**Maturity:**    ${maturity}`);
 
     return out.join('\n');
   }

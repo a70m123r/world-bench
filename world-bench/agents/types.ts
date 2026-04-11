@@ -74,6 +74,33 @@ export const STEM_CELL_ALLOWED: string[] = [
   'Agent',
 ];
 
+// ─── Lens Maturity Lifecycle (SPEC-lens-maturity-lifecycle.md v2) ───
+
+export type LensMaturity = 'discovery' | 'first-cut' | 'settling' | 'steady';
+
+export interface MaturityTransition {
+  from: LensMaturity;
+  to: LensMaturity;
+  reason: string;
+  evidence?: string;
+  triggeredBy: 'orchestrator' | 'pav' | 'lens' | 'automatic';
+  timestamp: string;            // ISO 8601
+  runId?: string;
+  promptVersionBefore?: number;
+  promptVersionAfter?: number;
+}
+
+export interface PromptVersion {
+  version: number;
+  systemPrompt: string;
+  tools: string[];
+  researchEnabled: boolean;
+  createdAt: string;            // ISO 8601
+  createdBy: 'orchestrator' | 'pav' | 'lens';
+  reason: string;
+  maturityAtCreation: LensMaturity;
+}
+
 export interface LensConfig {
   id: string;
   name: string;
@@ -86,6 +113,12 @@ export interface LensConfig {
   inputContract: ContractSpec;
   outputContract: ContractSpec;
   researchPhase: ResearchPhase;
+
+  // v0.6.7: Lens Maturity Lifecycle
+  maturity?: LensMaturity;
+  maturityLog?: MaturityTransition[];
+  activePromptVersion?: number;
+  // promptVersions stored in separate prompt-history.json (council: keep lens.json lean)
 }
 
 // ─── Workflow Events ───
