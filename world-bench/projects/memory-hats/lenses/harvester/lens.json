@@ -1,0 +1,101 @@
+{
+  "id": "harvester",
+  "name": "Harvester",
+  "purpose": "Pull raw messages from #room-orchestrator via Slack API. Handle pagination, thread expansion, user resolution, timestamps. Output a structured chronological dump that downstream lenses can process without touching Slack themselves.",
+  "systemPrompt": "You are the Harvester — the first neural lens in the memory-hats pipeline on World-Bench.\n\nYou are the architect of this lens. You have a working implementation from a prior successful run (harvest.py) that calls the Slack Web API directly via curl with a pre-authenticated bot token. Use it.\n\n## Your Goal\n\nPull every message from #room-orchestrator (channel ID: C0AQ6CZR0HM). Expand all threads. Resolve user IDs to display names. Output a single structured JSON array ordered oldest-first.\n\n## CRITICAL: Tool Access\n\nThe mcp__slack__ MCP tools DO NOT EXIST in your environment. Do NOT search for them. Do NOT attempt OAuth flows. Your Slack access is via the existing harvest.py script which uses curl + bot token from D:/OpenClawWorkspace/agents/rz-anthropic/slack-bridge/.env.\n\nIf you need to interact with Slack, use Bash to run curl commands or the harvest.py script. That's it.\n\n## Confirmed Design Decisions\n\n- Flat array with threadTs pointers (not nested)\n- Include bot messages with isBot flag\n- Include reactions and message subtypes\n- Full rebuild every run, no incremental state\n- Write JSON output to projects/memory-hats/lenses/harvester/output/harvest.json\n- Degrade on errors, log in metadata.errors",
+  "tools": [
+    "Read",
+    "Write",
+    "Edit",
+    "Bash",
+    "Glob",
+    "Grep"
+  ],
+  "slackPersona": {
+    "username": "Harvester",
+    "icon_emoji": ":satellite_antenna:"
+  },
+  "inputContract": {
+    "description": "Channel IDs to harvest. v1: single channel.",
+    "fields": {
+      "channels": {
+        "type": "string[]",
+        "required": true,
+        "description": "Slack channel IDs to pull messages from",
+        "v1_constraint": "Single element array: ['C0AQ6CZR0HM'] (#room-orchestrator)"
+      }
+    }
+  },
+  "outputContract": {
+    "description": "Chronological array of messages with full thread expansion and resolved identities.",
+    "fields": {
+      "messages": {
+        "type": "HarvestedMessage[]",
+        "description": "Ordered oldest-first. Every top-level message and every thread reply as a flat array.",
+        "itemShape": {
+          "ts": "string — Slack message timestamp (unique ID)",
+          "thread_ts": "string | null — Parent thread timestamp. null if top-level.",
+          "user_id": "string — Raw Slack user ID",
+          "username": "string — Resolved display name. 'unknown' if unresolvable.",
+          "text": "string — Raw message text",
+          "is_thread_parent": "boolean",
+          "reply_count": "number",
+          "reactions": "array",
+          "bot_id": "string | null",
+          "subtype": "string | null"
+        }
+      },
+      "metadata": {
+        "type": "object",
+        "fields": {
+          "channel_id": "string",
+          "channel_name": "string",
+          "message_count": "number",
+          "thread_count": "number",
+          "harvested_at": "string — ISO 8601",
+          "oldest_message_ts": "string",
+          "latest_message_ts": "string",
+          "errors": "array"
+        }
+      }
+    }
+  },
+  "researchPhase": {
+    "enabled": false
+  },
+  "state": "active",
+  "permissions": {
+    "tier": "stem",
+    "allowed": [
+      "Read",
+      "Glob",
+      "Grep",
+      "WebSearch",
+      "WebFetch",
+      "Write",
+      "Edit",
+      "Agent"
+    ],
+    "denied": [
+      "Bash",
+      "mcp__plugin_slack_slack__*"
+    ],
+    "granted": [],
+    "stableRunCount": 1,
+    "observedTools": []
+  },
+  "maturity": "settling",
+  "maturityLog": [
+    {
+      "from": "discovery",
+      "to": "settling",
+      "reason": "first successful render",
+      "evidence": "run d6e7fa7e completed, output contract met",
+      "triggeredBy": "automatic",
+      "timestamp": "2026-04-11T16:40:47.782Z",
+      "runId": "d6e7fa7e-51d3-4094-bb2c-aa1f342ee7df"
+    }
+  ],
+  "activePromptVersion": 2,
+  "slack_channel_id": "C0ARUMPDYSY"
+}

@@ -1,7 +1,17 @@
 node_modules/
 dist/
 orchestrator/config/.env
-projects/
 orchestrator/memory/
 orchestrator/runs/
 *.log
+
+# Projects: track structure + state files. Git history = project changelog.
+# Tracked: SEED.md, SHOOTS.md, project.json, lens.json, prompt-history.json, harvest.py
+# Ignored: rebuildable output, transient run artifacts, scratchpads
+harvest.json
+events.jsonl
+meta.json
+research-output.json
+scratchpad.md
+projects/*/lenses/*/output/
+projects/headline-jokes/
