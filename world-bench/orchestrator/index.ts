@@ -25,6 +25,7 @@ import {
   transitionMaturity, getMaturity, countConsecutiveCleanRenders,
   savePromptVersion, countWastedTurns,
 } from './maturity';
+import { buildLensContext } from './lens-context';
 
 // Load env from orchestrator config dir
 dotenv.config({ path: path.join(__dirname, 'config', '.env'), override: true });
@@ -1167,20 +1168,39 @@ export class Orchestrator {
     const persona = lens.slackPersona || { username: args.lensId, icon_emoji: ':dna:' };
 
     try {
+      // v0.6.9 Gate 2: inject structured context so the lens knows who it is,
+      // what it did last, and what Pav said about it. For fresh meets this is
+      // essential (the lens has no conversation history). For continue_meet it's
+      // supplemental (the lens already has its session history, but the context
+      // adds operational awareness).
+      let contextBlock = '';
+      try {
+        contextBlock = await buildLensContext(
+          args.projectSlug, args.lensId,
+          this.terminal.getSlackClient?.() || null,
+        );
+      } catch (e: any) {
+        console.warn(`[Orchestrator] Context injection failed (non-critical): ${e.message}`);
+      }
+
+      const enrichedMessage = contextBlock
+        ? `${contextBlock}\nFrom ${args.speaker}:\n${args.message}`
+        : args.message;
+
       let result: { output: string; sessionId?: string; status: string };
 
       if (args.sessionId) {
-        // Has session — continue existing conversation
+        // Has session — continue existing conversation with enriched message
         console.log(`[Orchestrator] Lens channel continue_meet: ${args.lensId} session ${args.sessionId.slice(0, 8)}`);
         result = await this.continueMeet(
-          args.projectSlug, args.lensId, args.speaker, args.message,
+          args.projectSlug, args.lensId, args.speaker, enrichedMessage,
           true, args.channelId, args.triggerTs,
         );
       } else {
-        // No session — spawn a fresh meet with the user's message
-        console.log(`[Orchestrator] Lens channel fresh meet: ${args.lensId} (no session, spawning new)`);
+        // No session — spawn a fresh meet with context + user's message
+        console.log(`[Orchestrator] Lens channel fresh meet: ${args.lensId} (no session, spawning new with context)`);
         result = await this.lensManager.runLensMeet(
-          lens, args.message, undefined, args.speaker,
+          lens, enrichedMessage, undefined, args.speaker,
         );
 
         // Capture the new sessionId so future messages can continue

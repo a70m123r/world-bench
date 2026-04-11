@@ -31,6 +31,12 @@ export class Terminal {
     this.client = this.app.client;
   }
 
+  // v0.6.9 Gate 2: expose the Slack WebClient for lens context injection
+  // (buildLensContext needs it to fetch lens channel history)
+  getSlackClient(): any {
+    return this.client;
+  }
+
   async start(): Promise<void> {
     // Register app_mention handler — fires when ANY user or bot tags @Orchestrator
     this.app.event('app_mention', async ({ event }) => {
