@@ -94,9 +94,14 @@ export class ClaudeAgentAdapter implements AgentAdapter {
       for await (const message of q) {
         if (abortController.signal.aborted) break;
 
-        // Capture lens session ID for resume support
-        if (message.type === 'system' && (message as any).subtype === 'init') {
+        // v0.6.9: capture session_id from ANY message that has it.
+        // The SDK emits session_id on every message type (system, assistant,
+        // result, etc.), not just the system/init message. The original code
+        // only checked system/init, which may not fire for all spawn modes
+        // (e.g., resume). Capture from the first message that has it.
+        if (!lensSessionId && (message as any).session_id) {
           lensSessionId = (message as any).session_id;
+          console.log(`[AgentAdapter] Captured sessionId: ${lensSessionId!.slice(0, 8)} from message type: ${message.type}`);
         }
 
         // Track user message IDs for file checkpointing rewind targets
