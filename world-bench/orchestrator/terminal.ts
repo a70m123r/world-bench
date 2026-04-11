@@ -203,7 +203,41 @@ export class Terminal {
         return;
       }
 
-      // Route 3: Messages in #wb-proj-* channels → feedback capture
+      // v0.6.8: Route 3: Messages in #wb-lens-* channels → continue_meet with that lens.
+      // The lens channel IS the meeting room. Any message from Pav (or Orchestrator)
+      // in a lens channel triggers continue_meet with that lens's session. This is the
+      // "lens-channel-as-meeting-room" pattern from the maturity lifecycle spec.
+      const lensBinding = this.getLensForChannel(channelId);
+      if (lensBinding) {
+        const isOrcTagged = this.botUserId && text.includes(`<@${this.botUserId}>`);
+        if (isOrcTagged) {
+          // Tagged in lens channel — defer to app_mention (same as thread routing)
+          console.log(`[Terminal] Tagged in lens channel ${channelId}, deferring to app_mention`);
+          return;
+        }
+
+        console.log(`[Terminal] Lens channel relay: ${userId} → ${lensBinding.lensId} in ${channelId}`);
+        try {
+          await this.orchestrator.handleLensThreadRelay({
+            channelId,
+            threadTs: (message as any).thread_ts || (message as any).ts,
+            binding: {
+              projectSlug: lensBinding.projectSlug,
+              lensId: lensBinding.lensId,
+              sessionId: lensBinding.sessionId,
+            },
+            speaker: userId === PAV_USER_ID ? 'pav' : 'orchestrator',
+            message: text,
+            triggerTs: (message as any).ts,
+          });
+        } catch (error: any) {
+          console.error('[Terminal] Lens channel relay failed:', error);
+          await this.postToChannel(channelId, `:warning: Relay to ${lensBinding.lensId} failed: ${error.message}`);
+        }
+        return;
+      }
+
+      // Route 4: Messages in #wb-proj-* channels → feedback capture
       const projectSlug = this.getProjectSlugForChannel(channelId);
       if (projectSlug) {
         console.log(`[Terminal] Feedback in proj-${projectSlug} from ${userId}: ${text.slice(0, 80)}`);
@@ -501,6 +535,36 @@ export class Terminal {
   }
 
   // ─── Feedback Capture ───
+
+  /**
+   * v0.6.8: Reverse-lookup for lens channels. Given a Slack channel ID, find
+   * which project + lens owns it. Returns the binding needed for continue_meet.
+   * Scans all projects → all lenses → checks lens.json.slack_channel_id.
+   */
+  private getLensForChannel(channelId: string): { projectSlug: string; lensId: string; sessionId: string } | null {
+    try {
+      const projectsDir = path.join(WORLD_BENCH_ROOT, 'projects');
+      if (!fs.existsSync(projectsDir)) return null;
+
+      for (const slug of fs.readdirSync(projectsDir)) {
+        const lensesDir = path.join(projectsDir, slug, 'lenses');
+        if (!fs.existsSync(lensesDir)) continue;
+
+        for (const lensId of fs.readdirSync(lensesDir)) {
+          const lensJsonPath = path.join(lensesDir, lensId, 'lens.json');
+          if (!fs.existsSync(lensJsonPath)) continue;
+
+          try {
+            const data = JSON.parse(fs.readFileSync(lensJsonPath, 'utf-8'));
+            if (data.slack_channel_id === channelId && data.sessionId) {
+              return { projectSlug: slug, lensId, sessionId: data.sessionId };
+            }
+          } catch { /* skip malformed */ }
+        }
+      }
+    } catch { }
+    return null;
+  }
 
   /**
    * Reverse-lookup: given a Slack channel ID, find which project it belongs to.
