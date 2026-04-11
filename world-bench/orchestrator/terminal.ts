@@ -205,27 +205,22 @@ export class Terminal {
 
       // v0.6.8: Route 3: Messages in #wb-lens-* channels → continue_meet with that lens.
       // The lens channel IS the meeting room. Any message from Pav (or Orchestrator)
-      // in a lens channel triggers continue_meet with that lens's session. This is the
-      // "lens-channel-as-meeting-room" pattern from the maturity lifecycle spec.
+      // in a lens channel triggers continue_meet with that lens's session.
       const lensBinding = this.getLensForChannel(channelId);
       if (lensBinding) {
         const isOrcTagged = this.botUserId && text.includes(`<@${this.botUserId}>`);
         if (isOrcTagged) {
-          // Tagged in lens channel — defer to app_mention (same as thread routing)
           console.log(`[Terminal] Tagged in lens channel ${channelId}, deferring to app_mention`);
           return;
         }
 
         console.log(`[Terminal] Lens channel relay: ${userId} → ${lensBinding.lensId} in ${channelId}`);
         try {
-          await this.orchestrator.handleLensThreadRelay({
+          await this.orchestrator.handleLensChannelMessage({
             channelId,
-            threadTs: (message as any).thread_ts || (message as any).ts,
-            binding: {
-              projectSlug: lensBinding.projectSlug,
-              lensId: lensBinding.lensId,
-              sessionId: lensBinding.sessionId,
-            },
+            projectSlug: lensBinding.projectSlug,
+            lensId: lensBinding.lensId,
+            sessionId: lensBinding.sessionId,
             speaker: userId === PAV_USER_ID ? 'pav' : 'orchestrator',
             message: text,
             triggerTs: (message as any).ts,
@@ -556,8 +551,11 @@ export class Terminal {
 
           try {
             const data = JSON.parse(fs.readFileSync(lensJsonPath, 'utf-8'));
-            if (data.slack_channel_id === channelId && data.sessionId) {
-              return { projectSlug: slug, lensId, sessionId: data.sessionId };
+            if (data.slack_channel_id === channelId) {
+              // sessionId may be undefined — the SDK's query() stream doesn't
+              // reliably emit session_id. handleLensChannelMessage handles
+              // the missing-session case by spawning a fresh meet.
+              return { projectSlug: slug, lensId, sessionId: data.sessionId || '' };
             }
           } catch { /* skip malformed */ }
         }

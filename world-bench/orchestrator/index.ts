@@ -1137,6 +1137,95 @@ export class Orchestrator {
    * Soren's structural-not-behavioral rule: the routing decision was already made
    * by the Terminal based on thread origin. We just dispatch the relay verbatim.
    *
+   * v0.6.8: Handle a message in a lens channel (#wb-lens-*).
+   * If the lens has a sessionId, uses continueMeet (resume existing conversation).
+   * If not (common — the SDK's query() stream doesn't reliably emit session_id),
+   * spawns a fresh meet session with the message as the user prompt. The lens
+   * gets its full system prompt + the user's message, responds, and the new
+   * sessionId is captured for future continue_meet calls.
+   */
+  async handleLensChannelMessage(args: {
+    channelId: string;
+    projectSlug: string;
+    lensId: string;
+    sessionId: string;  // may be empty string if not available
+    speaker: string;
+    message: string;
+    triggerTs: string;
+  }): Promise<void> {
+    await this.terminal.addThinkingReaction(args.channelId, args.triggerTs);
+
+    // Load the lens config from disk
+    const lens = this.loadLensFromDisk(args.projectSlug, args.lensId);
+    if (!lens) {
+      await this.terminal.removeThinkingReaction(args.channelId, args.triggerTs);
+      await this.terminal.postToChannel(args.channelId,
+        `:warning: Lens \`${args.lensId}\` not found on disk for project \`${args.projectSlug}\`.`);
+      return;
+    }
+
+    const persona = lens.slackPersona || { username: args.lensId, icon_emoji: ':dna:' };
+
+    try {
+      let result: { output: string; sessionId?: string; status: string };
+
+      if (args.sessionId) {
+        // Has session — continue existing conversation
+        console.log(`[Orchestrator] Lens channel continue_meet: ${args.lensId} session ${args.sessionId.slice(0, 8)}`);
+        result = await this.continueMeet(
+          args.projectSlug, args.lensId, args.speaker, args.message,
+          true, args.channelId, args.triggerTs,
+        );
+      } else {
+        // No session — spawn a fresh meet with the user's message
+        console.log(`[Orchestrator] Lens channel fresh meet: ${args.lensId} (no session, spawning new)`);
+        result = await this.lensManager.runLensMeet(
+          lens, args.message, undefined, args.speaker,
+        );
+
+        // Capture the new sessionId so future messages can continue
+        if (result.sessionId) {
+          const key = `${args.projectSlug}:${args.lensId}`;
+          this.pendingMeetSessions.set(key, {
+            sessionId: result.sessionId,
+            meetChannelId: args.channelId,
+            meetThreadTs: args.triggerTs,
+          });
+          // Also persist to lens.json for rehydration
+          try {
+            const lensJsonPath = path.join(
+              WORLD_BENCH_ROOT, 'projects', args.projectSlug, 'lenses', args.lensId, 'lens.json',
+            );
+            const lensData = JSON.parse(fs.readFileSync(lensJsonPath, 'utf-8'));
+            lensData.sessionId = result.sessionId;
+            fs.writeFileSync(lensJsonPath, JSON.stringify(lensData, null, 2));
+            console.log(`[Orchestrator] Persisted new sessionId ${result.sessionId.slice(0, 8)} to lens.json`);
+          } catch { }
+        }
+      }
+
+      await this.terminal.removeThinkingReaction(args.channelId, args.triggerTs);
+
+      if (result.status === 'failed') {
+        await this.terminal.postToChannel(args.channelId,
+          `:warning: ${args.lensId} relay failed: ${result.output?.slice(0, 300) || 'unknown error'}`);
+        return;
+      }
+
+      // Post the lens's response in the lens channel under its persona
+      const rawOutput = result.output || '_(no response)_';
+      const chunks = splitForSlack(rawOutput);
+      for (const chunk of chunks) {
+        await this.terminal.postToChannelAs(args.channelId, persona, chunk);
+      }
+    } catch (e: any) {
+      await this.terminal.removeThinkingReaction(args.channelId, args.triggerTs);
+      await this.terminal.postToChannel(args.channelId,
+        `:warning: Lens channel relay error: ${e.message}`);
+    }
+  }
+
+  /**
    * This is the path Pav uses for direct conversation with a lens — post in the
    * meet thread, words go through. No SDK conversation, no Orchestrator judgment,
    * just transport.
