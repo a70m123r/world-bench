@@ -1804,6 +1804,81 @@ export class Orchestrator {
         }
       }
 
+      // ─── amend_lens (v0.6.9 Gate 1) ───
+      // Merge-based config update for an existing lens. The Orchestrator uses this
+      // instead of writing lens.json directly (which is denied by canUseTool).
+      // Only modifies fields explicitly provided; preserves all runtime state
+      // (sessionId, slack_channel_id, maturity, maturityLog, activePromptVersion).
+      if (response.action === 'amend_lens' && response.plan) {
+        try {
+          const plan = response.plan;
+          if (!plan.projectSlug || !plan.lensId) {
+            throw new Error('amend_lens requires projectSlug and lensId');
+          }
+          const lensJsonPath = path.join(
+            WORLD_BENCH_ROOT, 'projects', plan.projectSlug, 'lenses', plan.lensId, 'lens.json',
+          );
+          if (!fs.existsSync(lensJsonPath)) {
+            throw new Error(`lens.json not found for ${plan.projectSlug}/${plan.lensId}`);
+          }
+
+          const existing = JSON.parse(fs.readFileSync(lensJsonPath, 'utf-8'));
+
+          // Protected fields that amend_lens CANNOT modify (runtime state)
+          const PROTECTED_FIELDS = new Set([
+            'sessionId', 'slack_channel_id', 'maturity', 'maturityLog',
+            'activePromptVersion', 'meetSessionId', 'meetChannelId', 'meetThreadTs',
+          ]);
+
+          // Merge: only update fields from plan.changes, skip protected fields
+          const changes = plan.changes || {};
+          const appliedChanges: string[] = [];
+          const skippedProtected: string[] = [];
+
+          for (const [key, value] of Object.entries(changes)) {
+            if (PROTECTED_FIELDS.has(key)) {
+              skippedProtected.push(key);
+              continue;
+            }
+            existing[key] = value;
+            appliedChanges.push(key);
+          }
+
+          fs.writeFileSync(lensJsonPath, JSON.stringify(existing, null, 2));
+
+          // Log to maturityLog if this is a settling change
+          const maturity = existing.maturity || 'discovery';
+          if (maturity === 'settling' || maturity === 'steady') {
+            const { transitionMaturity } = await import('./maturity');
+            transitionMaturity(plan.projectSlug, plan.lensId, maturity,
+              `amend_lens: ${appliedChanges.join(', ')} updated`,
+              'orchestrator',
+              { evidence: plan.reason || 'config amendment via amend_lens verb' },
+            );
+          }
+
+          // Save prompt version if systemPrompt or tools changed
+          if (appliedChanges.includes('systemPrompt') || appliedChanges.includes('tools') || appliedChanges.includes('researchPhase')) {
+            const { savePromptVersion } = await import('./maturity');
+            savePromptVersion(plan.projectSlug, plan.lensId, existing, plan.reason || 'amend_lens', 'orchestrator');
+          }
+
+          const summary = appliedChanges.length > 0
+            ? `Applied: ${appliedChanges.join(', ')}`
+            : 'No changes applied';
+          const skipSummary = skippedProtected.length > 0
+            ? ` | Skipped (protected): ${skippedProtected.join(', ')}`
+            : '';
+
+          await this.terminal.postToChannel(replyTo,
+            `:gear: \`amend_lens\` for \`${plan.lensId}\`: ${summary}${skipSummary}${plan.reason ? ` | Reason: ${plan.reason}` : ''}`,
+          );
+          console.log(`[Orchestrator] amend_lens ${plan.lensId}: ${summary}${skipSummary}`);
+        } catch (e: any) {
+          await this.terminal.postToChannel(replyTo, `:warning: amend_lens failed: ${e.message}`);
+        }
+      }
+
       // ─── Legacy actions (still supported for compatibility) ───
 
       // Resume a lens with new context (v0.5.1)
@@ -1926,7 +2001,7 @@ export class Orchestrator {
       // All protected paths are denied
       if (isProtectedPath(absTarget)) {
         const reason = absTarget.startsWith(path.resolve(root, 'projects'))
-          ? `${absTarget} is owned by SeedManager / LensManager. Mutating it directly bypasses the v0.6 lifecycle interlock. Use an action verb instead: create_seed, ignite_seed, amend_seed, propose_lens, meet_lens, continue_meet, render_lens, rehearse.`
+          ? `${absTarget} is owned by SeedManager / LensManager. Mutating it directly bypasses the v0.6 lifecycle interlock. Use an action verb instead: create_seed, ignite_seed, amend_seed, propose_lens, meet_lens, continue_meet, render_lens, amend_lens, rehearse.`
           : `${absTarget} is outside your write scope. The Orchestrator's only allowed file-write target is orchestrator/action.json. To mutate seeds, use action verbs. To mutate source, ask Spinner.`;
         console.warn(`[canUseTool] DENIED: ${toolName} on ${absTarget}`);
         return {
@@ -1942,7 +2017,7 @@ export class Orchestrator {
 
   private async converse(cmd: OrchestratorCommand, currentTurnId: string): Promise<{
     reply: string;
-    action: 'chat' | 'create_project' | 'status' | 'create_seed' | 'amend_seed' | 'ignite_seed' | 'propose_lens' | 'meet_lens' | 'continue_meet' | 'render_lens' | 'rehearse' | 'resume_lens';
+    action: 'chat' | 'create_project' | 'status' | 'create_seed' | 'amend_seed' | 'ignite_seed' | 'propose_lens' | 'meet_lens' | 'continue_meet' | 'render_lens' | 'rehearse' | 'resume_lens' | 'amend_lens';
     plan?: any;
   }> {
     const { query: sdkQuery } = require('@anthropic-ai/claude-agent-sdk');
@@ -2021,7 +2096,7 @@ Your sketch *may* contain multiple advisory entries that describe the shape you 
 - \`orchestrator/*\` (except \`action.json\`) — your own source code
 - \`agents/*\` — type definitions and stem cell config
 
-**Your only allowed write target is \`orchestrator/action.json\`.** Everything else mutates the world through action verbs (\`create_seed\`, \`amend_seed\`, \`ignite_seed\`, \`propose_lens\`, \`meet_lens\`, \`continue_meet\`, \`render_lens\`, \`rehearse\`), MCP tool calls (Memory, Slack), or Slack messages.
+**Your only allowed write target is \`orchestrator/action.json\`.** Everything else mutates the world through action verbs (\`create_seed\`, \`amend_seed\`, \`ignite_seed\`, \`propose_lens\`, \`meet_lens\`, \`continue_meet\`, \`render_lens\`, \`amend_lens\`, \`rehearse\`), MCP tool calls (Memory, Slack), or Slack messages.
 
 **The rule is not advisory.** If you try to \`Write\` a protected path, the SDK will deny it before the tool runs and you'll see the deny message in your tool result. Do not interpret a deny as "I should try a different write path." Interpret it as: *the action you wanted to take has a verb. Use the verb.*
 
@@ -2177,6 +2252,25 @@ Required fields: \`projectSlug\`, \`lensId\`, \`speaker\`, \`message\`, \`channe
   "lensConfig": { /* the single lens config from propose_lens */ }
 }
 \`\`\`
+
+**\`amend_lens\`** — update an existing rendered lens's config without clobbering runtime state. Use this for settling changes: removing tools, disabling research, narrowing the prompt. Routes through a merge that preserves sessionId, slack_channel_id, maturity, maturityLog, and activePromptVersion. **You may NOT modify lens.json by writing it directly — that path is denied at the capability boundary. Use this verb.**
+
+If the change modifies systemPrompt, tools, or researchPhase, a new prompt version is saved to prompt-history.json automatically. If the lens is in settling/steady maturity, a maturityLog entry is created.
+\`\`\`json
+{
+  "action": "amend_lens",
+  "projectSlug": "project-slug",
+  "lensId": "harvester",
+  "reason": "settling: removed dead MCP tools, disabled research",
+  "changes": {
+    "tools": ["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
+    "researchPhase": { "enabled": false },
+    "systemPrompt": "...narrowed operational prompt..."
+  }
+}
+\`\`\`
+
+Protected fields (cannot be modified via amend_lens): \`sessionId\`, \`slack_channel_id\`, \`maturity\`, \`maturityLog\`, \`activePromptVersion\`, \`meetSessionId\`, \`meetChannelId\`, \`meetThreadTs\`. These are runtime state managed by the infrastructure.
 
 **\`rehearse\`** — run two or more *already-rendered* lenses together to watch the seam. Composition, not differentiation. No new lenses are born here. Order matters — \`lensSlugs\` is the explicit pipeline; lens A's output flows into lens B as prior context. Per-lens outputs land in their respective lens channels; the project channel gets the chain summary. Use this when Pav says "run them together" or "show me how they hand off."
 
