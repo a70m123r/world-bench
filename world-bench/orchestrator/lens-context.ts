@@ -54,9 +54,12 @@ export async function buildLensContext(
     if (projectHistory) sections.push(projectHistory);
   }
 
-  // 6. Pipeline position — where this lens sits relative to others
+  // 6. Pipeline position + project shoots (if SHOOTS.md exists)
   const pipelineContext = getPipelinePosition(projectSlug, lensId);
   if (pipelineContext) sections.push(pipelineContext);
+
+  const shootsContext = getProjectShoots(projectSlug);
+  if (shootsContext) sections.push(shootsContext);
 
   // 7. Private scratchpad — lens's own notes to its future self
   const scratchpad = getScratchpad(projectSlug, lensId);
@@ -331,6 +334,47 @@ function getPipelinePosition(projectSlug: string, lensId: string): string | null
   } catch {
     return null;
   }
+}
+
+/**
+ * 6b. Project shoots — the living state of the project. If SHOOTS.md exists,
+ * include a summary (pipeline diagram + lens status table + what's next).
+ * Capped to avoid bloating context.
+ */
+function getProjectShoots(projectSlug: string): string | null {
+  const shootsPath = path.join(
+    WORLD_BENCH_ROOT, 'projects', projectSlug, 'SHOOTS.md',
+  );
+  try {
+    if (!fs.existsSync(shootsPath)) return null;
+    const content = fs.readFileSync(shootsPath, 'utf-8').trim();
+    if (!content) return null;
+
+    // Extract key sections: Pipeline diagram + Lens Status table + What's Next
+    const lines = content.split('\n');
+    const extracted: string[] = [];
+    extracted.push('**Project shoots** (living project state):');
+
+    let capturing = false;
+    let capturedLines = 0;
+    const captureSections = ['## Pipeline', '## Lens Status', '## What\'s Next', '## Blockers'];
+
+    for (const line of lines) {
+      if (captureSections.some(s => line.startsWith(s))) {
+        capturing = true;
+        capturedLines = 0;
+      } else if (line.startsWith('## ') && capturing) {
+        capturing = false;
+      }
+
+      if (capturing && capturedLines < 20) {
+        extracted.push(line);
+        capturedLines++;
+      }
+    }
+
+    return extracted.length > 1 ? extracted.join('\n') : null;
+  } catch { return null; }
 }
 
 /**
