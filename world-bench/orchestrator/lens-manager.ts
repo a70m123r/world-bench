@@ -404,7 +404,11 @@ Respond directly and conversationally. You are an architect and maintainer of yo
       purpose: lens.purpose,
       cwd: this.worldBenchRoot, // safe cwd; the lens has no workspace yet
       deniedTools: [...(lens.permissions?.denied || STEM_CELL_DENIED), ...Array.from(MUTATION_TOOLS)],
-      maxTurns: 5, // meetings are short by design
+      // v0.6.9: maxTurns depends on mode. Pre-render meets are short (5).
+      // Post-render conversations need room for tool use (Read workspace
+      // files, check output, etc.) — 15 turns is enough for a real exchange
+      // without burning credits on runaway sessions.
+      maxTurns: effectiveMode === 'conversation' ? 15 : 5,
     };
 
     // v0.6.5: thread sessionId through to the adapter for resume.
