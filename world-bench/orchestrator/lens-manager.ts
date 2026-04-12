@@ -95,6 +95,11 @@ export class LensManager {
     const deniedTools = [...(lens.permissions?.denied || STEM_CELL_DENIED)];
 
     // v0.5: load lens session ID for resume support
+    // v0.6.9: only resume if the session was created at the SAME cwd.
+    // Sessions from conversation-mode (cwd=worldBenchRoot) cannot be resumed
+    // by production renders (cwd=lensWorkspace) — different cwd = different
+    // session store directory. The SDK returns "No conversation found" if
+    // the session was created at a different cwd.
     const lensJsonPath = path.join(
       this.worldBenchRoot, 'projects', projectSlug, 'lenses', lens.id, 'lens.json',
     );
@@ -102,7 +107,12 @@ export class LensManager {
     try {
       if (fs.existsSync(lensJsonPath)) {
         const lensData = JSON.parse(fs.readFileSync(lensJsonPath, 'utf-8'));
-        resumeSessionId = lensData.sessionId;
+        // Only resume if sessionCwd matches the render cwd (lens workspace)
+        if (lensData.sessionId && lensData.sessionCwd === lensWorkspace) {
+          resumeSessionId = lensData.sessionId;
+        } else if (lensData.sessionId) {
+          console.log(`[LensManager] Skipping session resume for ${lens.id}: session cwd mismatch (session at ${lensData.sessionCwd || 'unknown'}, render at ${lensWorkspace})`);
+        }
       }
     } catch { }
 
@@ -228,6 +238,7 @@ export class LensManager {
     }
 
     // v0.5: persist lens session ID for resume on next run
+    // v0.6.9: also persist sessionCwd so we only resume from matching cwd
     const prodSessionId = (productionResult as any).sessionId;
     if (prodSessionId) {
       try {
@@ -235,6 +246,7 @@ export class LensManager {
           ? JSON.parse(fs.readFileSync(lensJsonPath, 'utf-8'))
           : { ...lens };
         lensData.sessionId = prodSessionId;
+        lensData.sessionCwd = lensWorkspace;
         fs.writeFileSync(lensJsonPath, JSON.stringify(lensData, null, 2));
       } catch { }
     }
