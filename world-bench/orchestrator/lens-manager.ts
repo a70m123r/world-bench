@@ -390,6 +390,7 @@ You can:
 - Suggest improvements to your own config or implementation
 - Read files in your workspace if you need to check something
 - Write notes to memory/scratchpad.md for your future self
+- Write an escalation to output/escalation.json if you hit a blocker — the Orchestrator reads it and posts to Slack. Shape: { "severity": "medium|high|critical", "message": "what's wrong", "context": "what you tried", "requestedAction": "what you need" }
 
 Respond directly and conversationally. You are an architect and maintainer of your lens, not a script runner.`;
     } else {

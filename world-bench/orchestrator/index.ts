@@ -557,6 +557,9 @@ export class Orchestrator {
       const audit = this.buildRunAudit(projectSlug, runId, lens.name, lens.id);
       await this.terminal.postToLensChannel(projectSlug, lens.id, lens, audit);
 
+      // v0.6.9: check for escalation.json — lens may have written one during the run
+      await this.checkAndPostEscalation(projectSlug, lens);
+
       // v0.6.7: maturity transitions based on run outcome
       const currentMaturity = getMaturity(projectSlug, lens.id);
       if (status === 'completed') {
@@ -734,6 +737,63 @@ export class Orchestrator {
    * see timing, tools used, escalation count, errors, and output stats — the
    * HOW, not just the WHAT.
    */
+  /**
+   * v0.6.9: Check for escalation.json in a lens's output dir. If found, post
+   * the escalation to both the lens channel and the project channel, then
+   * archive the file (rename to escalation-{timestamp}.json so it doesn't
+   * re-fire on the next render).
+   *
+   * Council decision: "File is the record, Slack is the attention surface.
+   * Wire them together." (Veil, 2026-04-12)
+   *
+   * The lens writes escalation.json during a render when it hits a blocker.
+   * Shape: { type, severity, message, context?, requestedAction? }
+   */
+  private async checkAndPostEscalation(projectSlug: string, lens: LensConfig): Promise<void> {
+    const escalationPath = path.join(
+      WORLD_BENCH_ROOT, 'projects', projectSlug, 'lenses', lens.id, 'output', 'escalation.json',
+    );
+
+    try {
+      if (!fs.existsSync(escalationPath)) return;
+
+      const raw = fs.readFileSync(escalationPath, 'utf-8');
+      const escalation = JSON.parse(raw);
+
+      const severity = escalation.severity || 'medium';
+      const severityIcon = severity === 'critical' ? ':rotating_light:'
+        : severity === 'high' ? ':warning:'
+        : ':information_source:';
+
+      const slackMsg = [
+        `${severityIcon} **Escalation from ${lens.name}** (${severity})`,
+        '',
+        `**Issue:** ${escalation.message || 'No message provided'}`,
+        escalation.context ? `**Context:** ${escalation.context}` : '',
+        escalation.requestedAction ? `**Requested action:** ${escalation.requestedAction}` : '',
+        '',
+        `_Filed via \`escalation.json\` during run. Orchestrator to review and act or escalate to Pav._`,
+      ].filter(Boolean).join('\n');
+
+      // Post to both surfaces
+      const persona = lens.slackPersona || { username: lens.name, icon_emoji: ':dna:' };
+      await this.terminal.postToLensChannel(projectSlug, lens.id, lens, slackMsg);
+      await this.terminal.postAsLens(lens, projectSlug, slackMsg);
+
+      // Archive the escalation file (don't delete — audit trail)
+      const archiveName = `escalation-${Date.now()}.json`;
+      const archivePath = path.join(
+        WORLD_BENCH_ROOT, 'projects', projectSlug, 'lenses', lens.id, 'output', archiveName,
+      );
+      fs.renameSync(escalationPath, archivePath);
+
+      console.log(`[Orchestrator] Escalation from ${lens.name} posted + archived: ${archiveName}`);
+    } catch (e: any) {
+      // Non-critical — don't crash the run for an escalation read failure
+      console.warn(`[Orchestrator] Failed to read/post escalation for ${lens.id}: ${e.message}`);
+    }
+  }
+
   private buildRunAudit(projectSlug: string, runId: string, lensName: string, lensId: string): string {
     const eventsPath = path.join(
       WORLD_BENCH_ROOT, 'projects', projectSlug, 'runs', runId, 'events.jsonl',
