@@ -1190,29 +1190,31 @@ export class Orchestrator {
       let result: { output: string; sessionId?: string; status: string };
 
       if (args.sessionId) {
-        // Has session — try to continue existing conversation
-        console.log(`[Orchestrator] Lens channel continue_meet: ${args.lensId} session ${args.sessionId.slice(0, 8)}`);
+        // Has session — resume via runLensMeet continuation mode.
+        // NOT continueMeet() — that requires thread bindings (G2/G3) which
+        // don't exist for lens channel messages. runLensMeet with
+        // mode='continuation' goes directly through the SDK resume path.
+        console.log(`[Orchestrator] Lens channel resume: ${args.lensId} session ${args.sessionId.slice(0, 8)}`);
         try {
-          result = await this.continueMeet(
-            args.projectSlug, args.lensId, args.speaker, enrichedMessage,
-            true, args.channelId, args.triggerTs,
+          result = await this.lensManager.runLensMeet(
+            lens, enrichedMessage, args.sessionId, args.speaker, 'continuation',
           );
         } catch (resumeErr: any) {
-          // v0.6.9: if session resume fails (cross-cwd, expired, etc.),
-          // fall back to fresh conversation mode. Better than "unknown error".
-          console.warn(`[Orchestrator] continue_meet failed for ${args.lensId}: ${resumeErr.message}. Falling back to fresh conversation.`);
+          // If session resume fails (cross-cwd, expired, etc.),
+          // fall back to fresh conversation mode.
+          console.warn(`[Orchestrator] Session resume failed for ${args.lensId}: ${resumeErr.message}. Falling back to fresh conversation.`);
           result = await this.lensManager.runLensMeet(
             lens, enrichedMessage, undefined, args.speaker, 'conversation',
           );
-          // Capture the new sessionId
-          if (result.sessionId) {
-            try {
-              const ljp = path.join(WORLD_BENCH_ROOT, 'projects', args.projectSlug, 'lenses', args.lensId, 'lens.json');
-              const ld = JSON.parse(fs.readFileSync(ljp, 'utf-8'));
-              ld.sessionId = result.sessionId;
-              fs.writeFileSync(ljp, JSON.stringify(ld, null, 2));
-            } catch { }
-          }
+        }
+        // Update sessionId (may be new from fallback, or same from resume)
+        if (result.sessionId) {
+          try {
+            const ljp = path.join(WORLD_BENCH_ROOT, 'projects', args.projectSlug, 'lenses', args.lensId, 'lens.json');
+            const ld = JSON.parse(fs.readFileSync(ljp, 'utf-8'));
+            ld.sessionId = result.sessionId;
+            fs.writeFileSync(ljp, JSON.stringify(ld, null, 2));
+          } catch { }
         }
       } else {
         // No session — spawn a fresh conversation with context + user's message
