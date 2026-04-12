@@ -1190,12 +1190,30 @@ export class Orchestrator {
       let result: { output: string; sessionId?: string; status: string };
 
       if (args.sessionId) {
-        // Has session — continue existing conversation with enriched message
+        // Has session — try to continue existing conversation
         console.log(`[Orchestrator] Lens channel continue_meet: ${args.lensId} session ${args.sessionId.slice(0, 8)}`);
-        result = await this.continueMeet(
-          args.projectSlug, args.lensId, args.speaker, enrichedMessage,
-          true, args.channelId, args.triggerTs,
-        );
+        try {
+          result = await this.continueMeet(
+            args.projectSlug, args.lensId, args.speaker, enrichedMessage,
+            true, args.channelId, args.triggerTs,
+          );
+        } catch (resumeErr: any) {
+          // v0.6.9: if session resume fails (cross-cwd, expired, etc.),
+          // fall back to fresh conversation mode. Better than "unknown error".
+          console.warn(`[Orchestrator] continue_meet failed for ${args.lensId}: ${resumeErr.message}. Falling back to fresh conversation.`);
+          result = await this.lensManager.runLensMeet(
+            lens, enrichedMessage, undefined, args.speaker, 'conversation',
+          );
+          // Capture the new sessionId
+          if (result.sessionId) {
+            try {
+              const ljp = path.join(WORLD_BENCH_ROOT, 'projects', args.projectSlug, 'lenses', args.lensId, 'lens.json');
+              const ld = JSON.parse(fs.readFileSync(ljp, 'utf-8'));
+              ld.sessionId = result.sessionId;
+              fs.writeFileSync(ljp, JSON.stringify(ld, null, 2));
+            } catch { }
+          }
+        }
       } else {
         // No session — spawn a fresh conversation with context + user's message
         console.log(`[Orchestrator] Lens channel conversation: ${args.lensId} (no session, spawning new with context)`);
