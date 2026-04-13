@@ -2,6 +2,9 @@
 // The OS of the system. Interprets Pav's intent, differentiates stem cells
 // into lenses, routes work, manages state, handles handoffs.
 
+// v0.7 DEBUG: lens.json write trap — remove after clobber is found
+import './lens-json-trap';
+
 import * as fs from 'fs';
 import * as path from 'path';
 import { v4 as uuid } from 'uuid';
