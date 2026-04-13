@@ -1827,58 +1827,65 @@ export class Orchestrator {
             throw new Error('meet_lens requires a projectSlug.');
           }
           const lens = this.hydrateLensConfig(plan.lensConfig);
-          // v0.6.5: post meeting message and CAPTURE the thread_ts so subsequent
-          // continue_meet calls in this thread can find the session via threadToSession.
-          // v0.6.5.1: ALL subsequent meet artifacts (harvester response, meeting complete)
-          // MUST be posted as REPLIES to this wave message so they share one Slack thread
-          // root. Otherwise they're scattered top-level sibling posts and Pav's reply
-          // lands in the wrong thread (the meeting complete's thread, not the wave's),
-          // and threadToSession doesn't know about it. The bound thread MUST be the
-          // visible thread Pav is replying in.
-          const meetingNotice = await this.terminal.postToChannelWithTs(replyTo,
-            `:wave: Meeting lens \`${lens.id}\` for project \`${plan.projectSlug}\`. Conversation only — no work runs. Standby for the lens's response in this thread...`,
-          );
-          const meetThreadTs = meetingNotice?.ts || cmd.thread_ts || cmd.ts;
-          // v0.6.5: thread channel + ts through to meetLens so it can populate
-          // the threadToSession reverse-lookup map (G1). The bound key here is
-          // (replyTo, meetThreadTs) — and that ts MUST be the wave message's ts
-          // so all subsequent thread replies route correctly.
-          const result = await this.meetLens(plan.projectSlug, lens, replyTo, meetThreadTs);
-          if (result.status === 'failed') {
-            // v0.6.5.1: failure post threaded under the wave too, so the wave thread
-            // contains the full record of what happened
+
+          // v0.7: ensure lens is attached (creates dirs, channel, lens.json on first meet)
+          const lensJsonPath = path.join(WORLD_BENCH_ROOT, 'projects', plan.projectSlug, 'lenses', lens.id, 'lens.json');
+          if (!fs.existsSync(lensJsonPath)) {
+            if (!this.projectExists(plan.projectSlug)) {
+              await this.bootstrapProject(plan.projectSlug, plan.projectSlug);
+            }
+            await this.attachLensToProject(plan.projectSlug, lens);
+          }
+
+          // v0.7: meeting happens IN the lens channel, not in replyTo.
+          // The lens channel is the lens's home from birth. Pav's subsequent
+          // messages in that channel route via lens-channel routing (v0.6.8.1).
+          const lensData = fs.existsSync(lensJsonPath)
+            ? JSON.parse(fs.readFileSync(lensJsonPath, 'utf-8'))
+            : {};
+          const meetChannel = lensData.slack_channel_id || replyTo;
+
+          // Post a pointer in the original channel so Pav knows where to go
+          if (meetChannel !== replyTo) {
             await this.terminal.postToChannel(replyTo,
+              `:wave: Meeting lens \`${lens.id}\` in <#${meetChannel}>. Head there to talk to it.`,
+            );
+          }
+
+          // Post the wave in the lens channel
+          await this.terminal.postToChannel(meetChannel,
+            `:wave: Meeting lens \`${lens.id}\` for project \`${plan.projectSlug}\`. Conversation only — no work runs. Post here to continue the conversation.`,
+          );
+
+          const result = await this.meetLens(plan.projectSlug, lens, meetChannel, undefined);
+          if (result.status === 'failed') {
+            await this.terminal.postToChannel(meetChannel,
               `:warning: Meeting with lens \`${lens.id}\` failed: ${result.output.slice(0, 500)}`,
-              meetThreadTs,
             );
           } else {
-            // Post the lens's response under its persona, THREADED UNDER the wave
-            // message (v0.6.5.1). The harvester response, the meeting complete post,
-            // and Pav's subsequent replies all live in one Slack thread rooted at
-            // the wave — which is the thread bound in threadToSession.
-            //
-            // v0.6.5.2: chunk the response via splitForSlack so long responses don't
-            // get truncated by Slack's per-message text limit. The production lens
-            // path (executeRun, line 471-478) already does this — the meet path was
-            // missing it. Symptom: Harvester response truncated mid-sentence in one
-            // message, plus a mysterious second empty Harvester message (likely
-            // @slack/web-api auto-retry on transient failure that succeeded server-side
-            // but timed out client-side).
             const persona = lens.slackPersona || { username: lens.name, icon_emoji: ':dna:' };
             const rawOutput = result.output || '_(no response captured)_';
             const chunks = splitForSlack(rawOutput);
-            console.log(`[Orchestrator] Posting ${chunks.length} chunk(s) of harvester response (total ${rawOutput.length} chars) to thread ${meetThreadTs}`);
-            for (let i = 0; i < chunks.length; i++) {
-              const chunk = chunks[i];
-              const labelled = chunks.length > 1
-                ? `${chunk}\n\n_(part ${i + 1}/${chunks.length})_`
-                : chunk;
-              await this.terminal.postToChannelAs(replyTo, persona, labelled, meetThreadTs);
+            for (const chunk of chunks) {
+              await this.terminal.postToChannelAs(meetChannel, persona, chunk);
             }
-            await this.terminal.postToChannel(replyTo,
-              `:speech_balloon: Meeting complete. Session \`${result.sessionId?.slice(0, 8) || 'unknown'}\` captured. *Reply directly in this thread* (the one you're reading right now) to continue the conversation — your message will be relayed verbatim to the lens via thread-aware routing. Tag \`@Orchestrator review\` to ask the Orchestrator's read on the lens's last response. Tag \`@Orchestrator [your message]\` for the Orchestrator to speak to the lens in its own voice. Say "render it" to commit.`,
-              meetThreadTs,
+            await this.terminal.postToChannel(meetChannel,
+              `:speech_balloon: Meeting complete. Session \`${result.sessionId?.slice(0, 8) || 'unknown'}\` captured. *Post here to continue the conversation* — your messages will be relayed to the lens automatically. Tag \`@Orchestrator\` to get the Orchestrator's take. Say "render it" to commit.`,
             );
+
+            // Persist sessionId to lens.json for the one-session model
+            if (result.sessionId) {
+              try {
+                const ld = JSON.parse(fs.readFileSync(lensJsonPath, 'utf-8'));
+                ld.sessionId = result.sessionId;
+                const workspace = path.join(WORLD_BENCH_ROOT, 'projects', plan.projectSlug, 'lenses', lens.id, 'workspace');
+                ld.sessionCwd = workspace;
+                const jsonStr = JSON.stringify(ld, null, 2);
+                trapLensJsonWrite(lensJsonPath, jsonStr);
+                fs.writeFileSync(lensJsonPath, jsonStr);
+                console.log(`[Orchestrator] Meet session ${result.sessionId.slice(0, 8)} persisted to lens.json`);
+              } catch { }
+            }
           }
         } catch (e: any) {
           await this.terminal.postToChannel(replyTo, `Meeting failed: ${e.message}`);
