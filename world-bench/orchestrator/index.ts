@@ -1289,6 +1289,10 @@ export class Orchestrator {
             const ljp = path.join(WORLD_BENCH_ROOT, 'projects', args.projectSlug, 'lenses', args.lensId, 'lens.json');
             const ld = JSON.parse(fs.readFileSync(ljp, 'utf-8'));
             ld.sessionId = result.sessionId;
+            // v0.6.9: one-session model — conversation now uses lens workspace cwd,
+            // matching render cwd. Record it so the render path knows it can resume.
+            const workspace = path.join(WORLD_BENCH_ROOT, 'projects', args.projectSlug, 'lenses', args.lensId, 'workspace');
+            ld.sessionCwd = workspace;
             fs.writeFileSync(ljp, JSON.stringify(ld, null, 2));
           } catch { }
         }
@@ -1314,8 +1318,10 @@ export class Orchestrator {
             );
             const lensData = JSON.parse(fs.readFileSync(lensJsonPath, 'utf-8'));
             lensData.sessionId = result.sessionId;
+            const workspace = path.join(WORLD_BENCH_ROOT, 'projects', args.projectSlug, 'lenses', args.lensId, 'workspace');
+            lensData.sessionCwd = workspace;
             fs.writeFileSync(lensJsonPath, JSON.stringify(lensData, null, 2));
-            console.log(`[Orchestrator] Persisted new sessionId ${result.sessionId.slice(0, 8)} to lens.json`);
+            console.log(`[Orchestrator] Persisted new sessionId ${result.sessionId.slice(0, 8)} to lens.json (cwd=${workspace.slice(-40)})`);
           } catch { }
         }
       }

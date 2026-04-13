@@ -409,18 +409,27 @@ Respond directly and conversationally. You are an architect and maintainer of yo
       meetPrompt = defaultIntro;
     }
 
-    // Build context — same as runLens, but no run_id (no run yet), no
-    // research phase, no priorLensOutput. Just identity + brief.
+    // v0.6.9: one-session model. Conversations and renders share the same
+    // cwd (lens workspace) so the SDK stores them in the same session directory.
+    // One session per lens, dormant between interactions, accumulating history.
+    // Pre-render meets (preflight) use worldBenchRoot since the workspace
+    // may not exist yet.
+    // Resolve the lens workspace if it exists, fall back to worldBenchRoot
+    let meetCwd = this.worldBenchRoot;
+    if (effectiveMode === 'conversation' || effectiveMode === 'continuation') {
+      // Post-render: try to use the lens workspace so sessions match renders
+      const possibleWorkspace = this.findLensWorkspace(lens.id);
+      if (possibleWorkspace && fs.existsSync(possibleWorkspace)) {
+        meetCwd = possibleWorkspace;
+      }
+    }
+
     const meetContext: Record<string, any> = {
       systemPrompt: buildLensSystemPrompt(lens),
       lens_name: lens.name,
       purpose: lens.purpose,
-      cwd: this.worldBenchRoot, // safe cwd; the lens has no workspace yet
+      cwd: meetCwd,
       deniedTools: [...(lens.permissions?.denied || STEM_CELL_DENIED), ...Array.from(MUTATION_TOOLS)],
-      // v0.6.9: maxTurns depends on mode. Pre-render meets are short (5).
-      // Post-render conversations need room for tool use (Read workspace
-      // files, check output, etc.) — 15 turns is enough for a real exchange
-      // without burning credits on runaway sessions.
       maxTurns: effectiveMode === 'conversation' ? 15 : 5,
     };
 
@@ -439,8 +448,10 @@ Respond directly and conversationally. You are an architect and maintainer of yo
       meetContext.mcpTools = mcpToolNames;
     }
 
-    const modeLabel = isContinuation ? `continuation (resume ${sessionId!.slice(0, 8)})` : 'preflight';
-    console.log(`[LensManager] Meeting lens "${lens.id}" in ${modeLabel} mode with ${meetTools.length} tool(s)`);
+    const modeLabel = effectiveMode === 'continuation' ? `continuation (resume ${sessionId!.slice(0, 8)})`
+      : effectiveMode === 'conversation' ? 'conversation (post-render)'
+      : 'preflight';
+    console.log(`[LensManager] Meeting lens "${lens.id}" in ${modeLabel} mode at cwd=${meetCwd.slice(-40)} with ${meetTools.length} tool(s)`);
     const result = await this.adapter.spawn(meetPrompt, meetTools, meetContext);
 
     return {
@@ -448,6 +459,22 @@ Respond directly and conversationally. You are an architect and maintainer of yo
       sessionId: (result as any).sessionId,
       status: result.status,
     };
+  }
+
+  /**
+   * Find the workspace path for a lens by scanning all projects.
+   * Returns the workspace dir if found, null otherwise.
+   */
+  private findLensWorkspace(lensId: string): string | null {
+    try {
+      const projectsDir = path.join(this.worldBenchRoot, 'projects');
+      if (!fs.existsSync(projectsDir)) return null;
+      for (const slug of fs.readdirSync(projectsDir)) {
+        const workspace = path.join(projectsDir, slug, 'lenses', lensId, 'workspace');
+        if (fs.existsSync(workspace)) return workspace;
+      }
+    } catch { }
+    return null;
   }
 
   /**
