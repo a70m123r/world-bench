@@ -3,7 +3,7 @@
 // into lenses, routes work, manages state, handles handoffs.
 
 // v0.7 DEBUG: lens.json write trap — remove after clobber is found
-import './lens-json-trap';
+import { trapLensJsonWrite } from './lens-json-trap';
 
 import * as fs from 'fs';
 import * as path from 'path';
@@ -564,7 +564,9 @@ export class Orchestrator {
     if (lensChannelId && !(lensWithSession as any).slack_channel_id) {
       const lensData = JSON.parse(fs.readFileSync(lensJsonPath, 'utf-8'));
       lensData.slack_channel_id = lensChannelId;
-      fs.writeFileSync(lensJsonPath, JSON.stringify(lensData, null, 2));
+      const jsonStr = JSON.stringify(lensData, null, 2);
+      trapLensJsonWrite(lensJsonPath, jsonStr);
+      fs.writeFileSync(lensJsonPath, jsonStr);
     }
 
     // Append to project.json's lenses array
@@ -1414,7 +1416,9 @@ export class Orchestrator {
             lensData.sessionId = result.sessionId;
             const workspace = path.join(WORLD_BENCH_ROOT, 'projects', args.projectSlug, 'lenses', args.lensId, 'workspace');
             lensData.sessionCwd = workspace;
-            fs.writeFileSync(lensJsonPath, JSON.stringify(lensData, null, 2));
+            const jsonStr2 = JSON.stringify(lensData, null, 2);
+            trapLensJsonWrite(lensJsonPath, jsonStr2);
+            fs.writeFileSync(lensJsonPath, jsonStr2);
             console.log(`[Orchestrator] Persisted new sessionId ${result.sessionId.slice(0, 8)} to lens.json (cwd=${workspace.slice(-40)})`);
           } catch { }
         }
@@ -2079,7 +2083,9 @@ export class Orchestrator {
             appliedChanges.push(key);
           }
 
-          fs.writeFileSync(lensJsonPath, JSON.stringify(existing, null, 2));
+          const jsonStr3 = JSON.stringify(existing, null, 2);
+          trapLensJsonWrite(lensJsonPath, jsonStr3);
+          fs.writeFileSync(lensJsonPath, jsonStr3);
 
           // Log to maturityLog if this is a settling change
           const maturity = existing.maturity || 'discovery';

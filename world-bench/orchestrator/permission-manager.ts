@@ -272,6 +272,7 @@ export class PermissionManager {
       this.worldBenchRoot, 'projects', projectSlug, 'lenses', lens.id, 'lens.json',
     );
     try {
+      if (!(lens as any).slack_channel_id) console.warn('[TRAP] permission-manager.ts writing lens.json WITHOUT slack_channel_id!', new Error().stack?.split('\n').slice(0,3).join('\n'));
       fs.writeFileSync(lensJsonPath, JSON.stringify(lens, null, 2));
     } catch (e: any) {
       console.error(`[PermissionManager] Failed to save lens config for ${lens.id}: ${e.message}`);

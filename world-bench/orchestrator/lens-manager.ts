@@ -247,7 +247,9 @@ export class LensManager {
           : { ...lens };
         lensData.sessionId = prodSessionId;
         lensData.sessionCwd = lensWorkspace;
-        fs.writeFileSync(lensJsonPath, JSON.stringify(lensData, null, 2));
+        const _json = JSON.stringify(lensData, null, 2);
+        if (!lensData.slack_channel_id) console.warn('[TRAP] lens-manager.ts:250 writing lens.json WITHOUT slack_channel_id!', new Error().stack?.split('\n').slice(0,3).join('\n'));
+        fs.writeFileSync(lensJsonPath, _json);
       } catch { }
     }
 

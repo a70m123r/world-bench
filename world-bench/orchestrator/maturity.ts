@@ -62,6 +62,7 @@ export function transitionMaturity(
   if (!lensData.maturityLog) lensData.maturityLog = [];
   lensData.maturityLog.push(transition);
 
+  if (!lensData.slack_channel_id) console.warn(`[TRAP] maturity.ts:65 writing lens.json for ${lensId} WITHOUT slack_channel_id!`);
   fs.writeFileSync(lensJsonPath, JSON.stringify(lensData, null, 2));
 
   console.log(`[Maturity] ${lensId}: ${from} → ${to} (${reason})`);
@@ -161,6 +162,7 @@ export function savePromptVersion(
   try {
     const lensData = JSON.parse(fs.readFileSync(lensJsonPath, 'utf-8'));
     lensData.activePromptVersion = newVersion.version;
+    if (!lensData.slack_channel_id) console.warn(`[TRAP] maturity.ts:165 writing lens.json for ${lensId} WITHOUT slack_channel_id!`);
     fs.writeFileSync(lensJsonPath, JSON.stringify(lensData, null, 2));
   } catch { }
 
