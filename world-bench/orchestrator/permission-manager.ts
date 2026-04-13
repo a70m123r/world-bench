@@ -272,8 +272,21 @@ export class PermissionManager {
       this.worldBenchRoot, 'projects', projectSlug, 'lenses', lens.id, 'lens.json',
     );
     try {
-      if (!(lens as any).slack_channel_id) console.warn('[TRAP] permission-manager.ts writing lens.json WITHOUT slack_channel_id!', new Error().stack?.split('\n').slice(0,3).join('\n'));
-      fs.writeFileSync(lensJsonPath, JSON.stringify(lens, null, 2));
+      // v0.7: read-merge-write pattern. The in-memory LensConfig doesn't have
+      // runtime fields (slack_channel_id, sessionId, sessionCwd, maturity,
+      // maturityLog, activePromptVersion). Writing `lens` directly would clobber
+      // them. Instead: read the existing disk state, merge the permission-related
+      // fields from the in-memory config, write back. Runtime fields survive.
+      let diskData: Record<string, any> = {};
+      if (fs.existsSync(lensJsonPath)) {
+        diskData = JSON.parse(fs.readFileSync(lensJsonPath, 'utf-8'));
+      }
+      // Merge permission-related fields from in-memory lens into disk state
+      diskData.permissions = lens.permissions;
+      diskData.state = lens.state;
+      // Also sync any other LensConfig fields that the permission manager might update
+      if (lens.tools) diskData.tools = lens.tools;
+      fs.writeFileSync(lensJsonPath, JSON.stringify(diskData, null, 2));
     } catch (e: any) {
       console.error(`[PermissionManager] Failed to save lens config for ${lens.id}: ${e.message}`);
     }
