@@ -532,8 +532,24 @@ export class Orchestrator {
         `Starting work on: ${taskPrompt.slice(0, 100)}...`,
       );
 
+      // v0.6.9: inject situational awareness into the task prompt so the lens
+      // knows its maturity, recent history, pipeline position, and SHOOTS.md
+      // state during production renders — not just during conversation mode.
+      let enrichedTaskPrompt = taskPrompt;
+      try {
+        const renderContext = await buildLensContext(
+          projectSlug, lens.id,
+          this.terminal.getSlackClient?.() || null,
+        );
+        if (renderContext) {
+          enrichedTaskPrompt = `${renderContext}\n${taskPrompt}`;
+        }
+      } catch (e: any) {
+        console.warn(`[Orchestrator] Render context injection failed (non-critical): ${e.message}`);
+      }
+
       const result = await this.lensManager.runLens(
-        lens, projectSlug, runId, taskPrompt, priorOutput, feedback,
+        lens, projectSlug, runId, enrichedTaskPrompt, priorOutput, feedback,
         // v0.6.6: thread terminal + verbose into the SDK hooks
         { terminal: this.terminal, lensId: lens.id, verbose },
       );
