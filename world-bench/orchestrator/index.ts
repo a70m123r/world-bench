@@ -2481,6 +2481,23 @@ When you want to DO something, write a file to \`${WORLD_BENCH_ROOT}/orchestrato
 \`\`\`
 
 **\`propose_lens\`** — draft a real lens config from a sketch entry. Pav reviews. After approval, the next step is *not* render — it's \`meet_lens\` (so the stem cell can read its own brief and respond before commitment). The system prompt should be a *brief*, not a recipe: tell the stem cell its goal, framework, and contracts, then trust it to figure out *how*. The stem cell is a specialist, not a worker.
+
+**When you post the proposal to Slack, present it as a human-readable brief — NOT raw JSON.** Format:
+
+\`\`\`
+:memo: **Signal Extractor** — lens proposal for memory-hats
+
+**Purpose:** [1-2 sentences]
+**Input:** [what it reads, from where]
+**Output:** [what it produces, where it writes]
+**Key constraints:** [the most important rules]
+**Research phase:** [enabled/disabled, what it does]
+**Tools:** [list]
+
+Reply "meet it" to introduce the stem cell, or "render it" to spawn directly.
+\`\`\`
+
+Save the full JSON to disk at \`projects/{slug}/proposals/{lens-id}.json\` so Spinner and the council can review the details. Pav reads the brief in Slack, not a JSON blob.
 \`\`\`json
 {
   "action": "propose_lens",
