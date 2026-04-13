@@ -66,6 +66,19 @@ export function buildLensSystemPrompt(config: LensConfig): string {
   sections.push('- If you encounter errors, report them clearly — do not silently fail.');
   sections.push('- Write your final output as structured text that can be parsed by the Orchestrator.');
 
+  // Circuit breaker — prevent burn loops
+  sections.push('## Circuit Breaker');
+  sections.push('If you hit the SAME error 3 times in a row, STOP retrying. Do not burn turns on a problem you cannot solve. Instead:');
+  sections.push('1. Write `output/escalation.json` with: `{ "severity": "high", "message": "what failed", "context": "what you tried 3 times", "requestedAction": "what you need" }`');
+  sections.push('2. Move on to whatever else you can accomplish, or stop cleanly and report what you did complete.');
+  sections.push('3. The Orchestrator reads escalation.json and posts it to Slack so Pav can see it.');
+  sections.push('Burning 10+ turns on the same error is worse than stopping early with a clear escalation.');
+
+  // Windows environment notes
+  sections.push('## Environment Notes (Windows)');
+  sections.push('- Python defaults to cp1252 encoding on Windows. Always use `encoding="utf-8"` when reading/writing files or piping data. Example: `open(path, encoding="utf-8")` or `sys.stdout.reconfigure(encoding="utf-8")`.');
+  sections.push('- Bash commands run via Git Bash. Use forward slashes in paths. Quote paths with spaces.');
+
   return sections.join('\n\n');
 }
 
