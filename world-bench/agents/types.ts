@@ -78,6 +78,18 @@ export const STEM_CELL_ALLOWED: string[] = [
 
 export type LensMaturity = 'discovery' | 'first-cut' | 'settling' | 'steady';
 
+// v0.7: Orchestrator uses the same maturity spine as lenses (no 'first-cut' — doesn't render)
+export type OrchestratorMaturity = 'discovery' | 'settling' | 'steady';
+
+export interface OrchestratorState {
+  sessionId?: string;
+  sessionCwd: string;
+  maturity: OrchestratorMaturity;
+  maturityLog: MaturityTransition[];
+  activePromptVersion: number;
+  lastActivity: string;  // ISO 8601
+}
+
 export interface MaturityTransition {
   from: LensMaturity;
   to: LensMaturity;

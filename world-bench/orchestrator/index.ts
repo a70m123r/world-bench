@@ -13,6 +13,7 @@ import {
   ProjectSeed,
   WorkflowEvent,
   OrchestratorCommand,
+  OrchestratorState,
   STEM_CELL_ALLOWED,
   STEM_CELL_DENIED,
 } from '../agents/types';
@@ -33,18 +34,14 @@ dotenv.config({ path: path.join(__dirname, 'config', '.env'), override: true });
 const WORLD_BENCH_ROOT = process.env.WORLD_BENCH_ROOT || path.resolve(__dirname, '..');
 const PAV_USER_ID = process.env.PAV_USER_ID || 'U0AL61DRV6D';
 
-// Session tracking — persist across messages so Claude remembers the conversation
-interface OrchestratorSession {
-  sessionId?: string;
-  lastActivity: Date;
-}
-
+// v0.7: unified state — same spine as lenses
 export class Orchestrator {
   private adapter: ClaudeAgentAdapter;
   private lensManager: LensManager;
   private terminal: Terminal;
   private contextProvider: ContextProvider | null = null;
-  private sessions: Map<string, OrchestratorSession> = new Map();
+  private orchestratorState!: OrchestratorState;
+  private lastPromptHash: string | null = null;
   private mcpServers: Record<string, any> | null = null;
   private availableMcpTools: string[] = [];
   private seedManager: SeedManager;
@@ -89,9 +86,15 @@ export class Orchestrator {
     this.seedManager = new SeedManager(WORLD_BENCH_ROOT);
     this.terminal = new Terminal(this);
     this.loadMcpConfig();
-    this.loadSessionsFromDisk();
+    this.loadOrchestratorState();
     // v0.6.5 (G5): rebuild thread→session map from disk for rendered lenses
     this.rehydrateLensSessions();
+    // v0.7: ensure scratchpad exists
+    const scratchpadPath = path.join(WORLD_BENCH_ROOT, 'orchestrator', 'memory', 'scratchpad.md');
+    if (!fs.existsSync(scratchpadPath)) {
+      fs.mkdirSync(path.dirname(scratchpadPath), { recursive: true });
+      fs.writeFileSync(scratchpadPath, '# Orchestrator Scratchpad\n\n> Notes you leave here persist across sessions and appear in your context on every wake.\n');
+    }
   }
 
   /** Called by Terminal after Slack client is ready */
@@ -147,31 +150,65 @@ export class Orchestrator {
     return tools;
   }
 
-  private loadSessionsFromDisk(): void {
-    const sessionsPath = path.join(WORLD_BENCH_ROOT, 'orchestrator', 'sessions.json');
+  private loadOrchestratorState(): void {
+    // v0.7: unified state file replaces the legacy sessions.json Map
+    const statePath = path.join(WORLD_BENCH_ROOT, 'orchestrator', 'orchestrator.json');
     try {
-      if (fs.existsSync(sessionsPath)) {
-        const entries: [string, OrchestratorSession][] = JSON.parse(fs.readFileSync(sessionsPath, 'utf-8'));
-        for (const [key, session] of entries) {
-          session.lastActivity = new Date(session.lastActivity);
-          this.sessions.set(key, session);
-        }
-        console.log(`[Orchestrator] Loaded ${this.sessions.size} sessions from disk`);
+      if (fs.existsSync(statePath)) {
+        this.orchestratorState = JSON.parse(fs.readFileSync(statePath, 'utf-8'));
+        console.log(`[Orchestrator] State loaded: maturity=${this.orchestratorState.maturity}, session=${this.orchestratorState.sessionId?.slice(0, 8) || 'none'}`);
+        return;
+      }
+    } catch (e: any) {
+      console.warn(`[Orchestrator] Failed to load orchestrator.json: ${e.message}`);
+    }
+
+    // Migration: read legacy sessions.json if orchestrator.json doesn't exist
+    const legacyPath = path.join(WORLD_BENCH_ROOT, 'orchestrator', 'sessions.json');
+    let migratedSessionId: string | undefined;
+    try {
+      if (fs.existsSync(legacyPath)) {
+        const entries: [string, any][] = JSON.parse(fs.readFileSync(legacyPath, 'utf-8'));
+        const main = entries.find(([key]) => key === 'orchestrator-main');
+        if (main) migratedSessionId = main[1].sessionId;
+        console.log(`[Orchestrator] Migrated sessionId from sessions.json: ${migratedSessionId?.slice(0, 8) || 'none'}`);
       }
     } catch { }
+
+    // First boot or migration — create default state
+    this.orchestratorState = {
+      sessionId: migratedSessionId,
+      sessionCwd: WORLD_BENCH_ROOT,
+      maturity: 'settling',
+      maturityLog: [{
+        from: 'discovery' as any,
+        to: 'settling' as any,
+        reason: 'v0.7 unification — Orchestrator has been running since v0.4',
+        triggeredBy: 'automatic',
+        timestamp: new Date().toISOString(),
+      }],
+      activePromptVersion: 1,
+      lastActivity: new Date().toISOString(),
+    };
+    this.saveOrchestratorState();
   }
 
-  private saveSessionsToDisk(): void {
-    const sessionsPath = path.join(WORLD_BENCH_ROOT, 'orchestrator', 'sessions.json');
+  private saveOrchestratorState(): void {
+    const statePath = path.join(WORLD_BENCH_ROOT, 'orchestrator', 'orchestrator.json');
     try {
-      fs.writeFileSync(sessionsPath, JSON.stringify(Array.from(this.sessions.entries()), null, 2));
-    } catch { }
+      fs.writeFileSync(statePath, JSON.stringify(this.orchestratorState, null, 2));
+    } catch (e: any) {
+      console.warn(`[Orchestrator] Failed to save orchestrator.json: ${e.message}`);
+    }
   }
 
-  private getSessionKey(cmd: OrchestratorCommand): string {
-    // Single brain — one session across all channels.
-    // The Orchestrator is one agent, not a per-channel bot.
-    return `orchestrator-main`;
+  private hashString(s: string): string {
+    let hash = 2166136261;
+    for (let i = 0; i < s.length; i++) {
+      hash ^= s.charCodeAt(i);
+      hash = (hash * 16777619) >>> 0;
+    }
+    return hash.toString(36);
   }
 
   private loadMemoryContext(): string {
@@ -221,6 +258,60 @@ export class Orchestrator {
         }
         if (legacySummaries.length > 0) {
           sections.push(`## Legacy Projects (pre-v0.6, grandfathered)\n${legacySummaries.join('\n')}`);
+        }
+      }
+    } catch { }
+
+    // v0.7: Orchestrator scratchpad — notes to future self
+    const scratchpadPath = path.join(WORLD_BENCH_ROOT, 'orchestrator', 'memory', 'scratchpad.md');
+    try {
+      if (fs.existsSync(scratchpadPath)) {
+        const content = fs.readFileSync(scratchpadPath, 'utf-8').trim();
+        if (content && content !== '# Orchestrator Scratchpad') {
+          const capped = content.length > 2000
+            ? content.slice(0, 2000) + '\n...(truncated, full file at orchestrator/memory/scratchpad.md)'
+            : content;
+          sections.push(`## Your Scratchpad (notes you left for yourself)\n${capped}`);
+        }
+      }
+    } catch { }
+
+    // v0.7: Orchestrator state summary
+    if (this.orchestratorState) {
+      const stateLines: string[] = [];
+      stateLines.push(`## Your State (orchestrator.json)`);
+      stateLines.push(`- Maturity: ${this.orchestratorState.maturity}`);
+      stateLines.push(`- Prompt version: ${this.orchestratorState.activePromptVersion}`);
+      stateLines.push(`- Session: ${this.orchestratorState.sessionId?.slice(0, 8) || 'none'}`);
+      if (this.orchestratorState.maturityLog?.length > 0) {
+        const last3 = this.orchestratorState.maturityLog.slice(-3);
+        stateLines.push('- Recent transitions:');
+        for (const entry of last3) {
+          stateLines.push(`  - ${entry.from} → ${entry.to}: ${entry.reason}`);
+        }
+      }
+      sections.push(stateLines.join('\n'));
+    }
+
+    // v0.7: All-project SHOOTS.md — cross-project awareness
+    try {
+      if (fs.existsSync(projectsDir)) {
+        const shootsSections: string[] = [];
+        let projectCount = 0;
+        for (const slug of fs.readdirSync(projectsDir)) {
+          if (projectCount >= 3) break; // Cap at 3 projects per Claw's guard
+          const shootsPath = path.join(projectsDir, slug, 'SHOOTS.md');
+          if (!fs.existsSync(shootsPath)) continue;
+          const content = fs.readFileSync(shootsPath, 'utf-8').trim();
+          if (!content) continue;
+          const capped = content.length > 1500
+            ? content.slice(0, 1500) + '\n...(truncated)'
+            : content;
+          shootsSections.push(`### ${slug}\n${capped}`);
+          projectCount++;
+        }
+        if (shootsSections.length > 0) {
+          sections.push(`## Project Shoots (living state)\n${shootsSections.join('\n\n')}`);
         }
       }
     } catch { }
@@ -2142,6 +2233,11 @@ export class Orchestrator {
       if (absTarget.endsWith('SHOOTS.md') && absTarget.includes('projects')) {
         return { behavior: 'allow', updatedInput: input };
       }
+      // v0.7: Orchestrator scratchpad — notes to future self
+      const allowedScratchpad = path.resolve(root, 'orchestrator', 'memory', 'scratchpad.md');
+      if (absTarget === allowedScratchpad) {
+        return { behavior: 'allow', updatedInput: input };
+      }
 
       // All protected paths are denied
       if (isProtectedPath(absTarget)) {
@@ -2244,6 +2340,7 @@ Your sketch *may* contain multiple advisory entries that describe the shape you 
 **Your allowed write targets:**
 - \`orchestrator/action.json\` — your dispatch surface for action verbs
 - \`projects/*/SHOOTS.md\` — the living project state document (see below)
+- \`orchestrator/memory/scratchpad.md\` — your private notes to your future self (see Scratchpad section)
 
 Everything else mutates the world through action verbs (\`create_seed\`, \`amend_seed\`, \`ignite_seed\`, \`propose_lens\`, \`meet_lens\`, \`continue_meet\`, \`render_lens\`, \`amend_lens\`, \`rehearse\`), MCP tool calls (Memory, Slack), or Slack messages.
 
@@ -2314,6 +2411,16 @@ You have a personal knowledge graph via the "memory" MCP server. Use it:
 - After significant decisions: store entities and relations
 - Before claiming you don't know something: search your memory first
 - Store things useful to your future self waking up cold
+
+## Scratchpad
+
+You have a private scratchpad at \`orchestrator/memory/scratchpad.md\`. Use it to leave notes for your future self:
+- Active decisions and their rationale
+- Things Pav mentioned that aren't in seeds yet
+- Patterns you've noticed across projects
+- Reminders about lens behaviors or infrastructure quirks
+
+These notes appear in your context on every wake. Write to this file using the Write tool — it's in your allowed write targets. Keep it concise — capped at 2000 chars in context.
 
 ## Available MCP Tools (canonical names — use EXACTLY these, do not guess)
 
@@ -2460,13 +2567,7 @@ When you receive a message, use slack_read_channel to check recent history. Neve
 
 If you're in a lens channel (#wb-lens-*), read its history. If you're in a project channel (#wb-proj-*), read it for project status. If you're in any other channel, read the last few messages for context.` + this.loadMemoryContext();
 
-    // Session management — resume if we've talked before
-    const sessionKey = this.getSessionKey(cmd);
-    let session = this.sessions.get(sessionKey);
-    if (!session) {
-      session = { lastActivity: new Date() };
-      this.sessions.set(sessionKey, session);
-    }
+    // v0.7: session management — one continuous session via orchestratorState
 
     const options: any = {
       outputFormat: 'stream-json',
@@ -2487,9 +2588,9 @@ If you're in a lens channel (#wb-lens-*), read its history. If you're in a proje
       canUseTool: this.makeCanUseTool(),
     };
 
-    // Resume existing session for conversation continuity
-    if (session.sessionId) {
-      options.resume = session.sessionId;
+    // v0.7: resume from orchestrator state
+    if (this.orchestratorState.sessionId) {
+      options.resume = this.orchestratorState.sessionId;
     }
 
     // Wire MCP servers (memory + Slack)
@@ -2538,12 +2639,12 @@ If you're in a lens channel (#wb-lens-*), read its history. If you're in a proje
         prompt: fullPrompt,
         options,
       })) {
-        // Capture session ID on init
-        if (msg.type === 'system' && (msg as any).subtype === 'init') {
-          session.sessionId = (msg as any).session_id;
-          session.lastActivity = new Date();
-          this.saveSessionsToDisk();
-          console.log(`[Orchestrator] Session: ${session.sessionId}`);
+        // v0.7: capture session ID into orchestrator state
+        if (!this.orchestratorState.sessionId && (msg as any).session_id) {
+          this.orchestratorState.sessionId = (msg as any).session_id;
+          this.orchestratorState.lastActivity = new Date().toISOString();
+          this.saveOrchestratorState();
+          console.log(`[Orchestrator] Session: ${this.orchestratorState.sessionId}`);
         }
 
         // Collect text + log tools
@@ -2569,8 +2670,26 @@ If you're in a lens channel (#wb-lens-*), read its history. If you're in a proje
         }
       }
 
-    session.lastActivity = new Date();
-    this.saveSessionsToDisk();
+    this.orchestratorState.lastActivity = new Date().toISOString();
+
+    // v0.7: lightweight prompt versioning — detect system prompt changes
+    const promptHash = this.hashString(systemPrompt);
+    if (this.lastPromptHash && this.lastPromptHash !== promptHash) {
+      this.orchestratorState.activePromptVersion = (this.orchestratorState.activePromptVersion || 0) + 1;
+      this.orchestratorState.maturityLog.push({
+        from: this.orchestratorState.maturity as any,
+        to: this.orchestratorState.maturity as any,
+        reason: 'system prompt changed (hash mismatch)',
+        triggeredBy: 'automatic',
+        timestamp: new Date().toISOString(),
+        promptVersionBefore: this.orchestratorState.activePromptVersion - 1,
+        promptVersionAfter: this.orchestratorState.activePromptVersion,
+      });
+      console.log(`[Orchestrator] Prompt version bumped to ${this.orchestratorState.activePromptVersion}`);
+    }
+    this.lastPromptHash = promptHash;
+
+    this.saveOrchestratorState();
 
     // Check if the Orchestrator wrote an action file
     const actionPath = path.join(WORLD_BENCH_ROOT, 'orchestrator', 'action.json');
