@@ -416,14 +416,15 @@ Respond directly and conversationally. You are an architect and maintainer of yo
     // One session per lens, dormant between interactions, accumulating history.
     // Pre-render meets (preflight) use worldBenchRoot since the workspace
     // may not exist yet.
-    // Resolve the lens workspace if it exists, fall back to worldBenchRoot
+    // v0.7: one-session model — ALL modes use the lens workspace if it exists.
+    // The meet_lens handler creates the workspace before calling runLensMeet,
+    // so even preflight meets have a workspace. Using worldBenchRoot as cwd
+    // creates sessions that can't be resumed from the workspace cwd (the
+    // cross-cwd bug that's bitten us 4+ times).
     let meetCwd = this.worldBenchRoot;
-    if (effectiveMode === 'conversation' || effectiveMode === 'continuation') {
-      // Post-render: try to use the lens workspace so sessions match renders
-      const possibleWorkspace = this.findLensWorkspace(lens.id);
-      if (possibleWorkspace && fs.existsSync(possibleWorkspace)) {
-        meetCwd = possibleWorkspace;
-      }
+    const possibleWorkspace = this.findLensWorkspace(lens.id);
+    if (possibleWorkspace && fs.existsSync(possibleWorkspace)) {
+      meetCwd = possibleWorkspace;
     }
 
     const meetContext: Record<string, any> = {
