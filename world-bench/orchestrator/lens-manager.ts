@@ -137,7 +137,10 @@ export class LensManager {
       // quoting failures — before doing any useful work. Research phases + real
       // implementation legitimately need more than 10 turns. The per-lens
       // maxTurns override in lens.json takes precedence if present.
-      maxTurns: (lens as any).maxTurns || 30,
+      // v0.7: 60 turns for production. The SE burned through 30 across 4 renders
+      // doing read → edit → run → validate cycles. 30 is enough for simple lenses
+      // (Harvester: 4 turns) but too tight for lenses that build + iterate scripts.
+      maxTurns: (lens as any).maxTurns || 60,
       // v0.6.6: lens channel streaming context (threaded from executeRun)
       ...(streamingContext ? {
         terminal: streamingContext.terminal,
@@ -433,7 +436,9 @@ Respond directly and conversationally. You are an architect and maintainer of yo
       purpose: lens.purpose,
       cwd: meetCwd,
       deniedTools: [...(lens.permissions?.denied || STEM_CELL_DENIED), ...Array.from(MUTATION_TOOLS)],
-      maxTurns: effectiveMode === 'conversation' ? 15 : 5,
+      // v0.7: conversation + continuation both need room for tool use.
+      // Only preflight (pre-render intro) is short (5 turns).
+      maxTurns: effectiveMode === 'preflight' ? 5 : 15,
     };
 
     // v0.6.5: thread sessionId through to the adapter for resume.
