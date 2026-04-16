@@ -1,0 +1,26 @@
+{
+  "name": "world-bench",
+  "version": "0.4.0",
+  "description": "World-Bench Orchestrator — stem cell agent framework with Slack surface",
+  "main": "dist/orchestrator/index.js",
+  "scripts": {
+    "start": "tsx orchestrator/index.ts",
+    "dev": "tsx watch orchestrator/index.ts",
+    "build": "tsc",
+    "prod": "node dist/orchestrator/index.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.81",
+    "@anthropic-ai/claude-code": "^2.1.81",
+    "@slack/bolt": "^4.4.0",
+    "@slack/web-api": "^7.9.1",
+    "dotenv": "^16.6.0",
+    "uuid": "^11.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.4",
+    "@types/uuid": "^10.0.0",
+    "tsx": "^4.20.3",
+    "typescript": "^5.8.3"
+  }
+}
