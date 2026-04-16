@@ -10,15 +10,15 @@ Build a filtered, role-specific working view (a 'hat') over shared memory. Each 
 
 ## Output Shape
 
-When Pav asks 'what's going on right now?' the Orchestrator returns a useful, structured answer drawn from the hat — not a raw channel dump. The hat is a persistent artifact that updates with new data and filters by role. Concretely: a markdown file at world-bench/hats/orchestrator/hat.md with sections Active Seeds / Recent Decisions / Pav's Latest Direction / Blocked Items, soft cap ~500 words, readable by humans and agents, no JSON.
+When Pav asks 'what's going on right now?' the Orchestrator returns a useful, structured answer drawn from the hat — not a raw channel dump. The hat is a persistent artifact that updates with new data and filters by role. Concretely: a markdown file at world-bench/hats/orchestrator/hat.md with sections Active Seeds / Recent Decisions / Pav's Latest Direction / Blocked Items / Changelog / Sources, soft cap ~500 words, readable by humans and agents, no JSON. Each section carries staleness and confidence indicators. Source pointers trace back to compiled/ pages for auditability.
 
 ## Artifact
 
 - **Path:** `world-bench/hats/orchestrator/hat.md`
 - **Format:** markdown
-- **Sections:** Active Seeds / Recent Decisions / Pav's Latest Direction / Blocked Items
+- **Sections:** Active Seeds / Recent Decisions / Pav's Latest Direction / Blocked Items / Changelog / Sources
 - **Soft cap:** ~500 words
-- **Notes:** On-demand rebuild, no persistence layer, no watermark. Full pipeline runs every time the hat is requested — that's the feature, not a bug.
+- **Notes:** On-demand rebuild, full pipeline runs every time. Each section includes staleness indicator (newest signal timestamp) and confidence level. Source pointers trace to compiled/ pages for auditability. No raw Slack — compiled/ is the only upstream input.
 
 ## Constraints
 
@@ -29,15 +29,17 @@ When Pav asks 'what's going on right now?' the Orchestrator returns a useful, st
 
 **Process (how to build):**
 - shape-cutting is manual until v0.7 — Pav mediates contract alignment between lenses
-- every lens declares concrete inputContract and outputContract. Real field names, types, cardinality. Not 'raw messages with metadata.'
-- the Harvester's outputContract becomes the template for every downstream boundary — write it like a spec
-- start with the Harvester to get ground-truth data before tuning Signal Extractor's tagging rules
+- every lens declares concrete inputContract and outputContract. Real field names, types, cardinality.
+- Karpathy LLM Wiki pattern is the architectural foundation: raw sources → compiled wiki → presentation
+- Hat Renderer reads compiled/ only — no harvest.json, no raw Slack. If the hat can't be produced from compiled/ alone, the failure belongs upstream (Claw's acceptance gate)
+- Hat compiles for action, not elegance: selection over paraphrase, source pointers over smooth prose, 'insufficient evidence' over filler (Claw)
+- Each hat section carries staleness (per-section newest signal timestamp) and confidence indicators (Claw)
 
 ## Lens Sketch (advisory — not executable)
 
-- **Harvester** (`harvester`) — Pulls raw messages from #room-orchestrator via Slack MCP. Handles pagination, thread expansion, timestamps. Outputs raw chronological dump with metadata. Designed so adding channels later is a config change, not a rewrite. Contracts (inputContract / outputContract) at this lens's boundaries are mandatory and concrete. Pav mediates seam alignment manually until v0.7 shape-cutting lands.
-- **Signal Extractor** (`signal-extractor`) — Reads raw message dump, strips tool noise, tags entries by type (decision, action, task, direction, observation). Extracts entities and relationships. Outputs structured signal. If the downstream hat exceeds ~500 words, this lens is letting too much through. Contracts (inputContract / outputContract) at this lens's boundaries are mandatory and concrete. Pav mediates seam alignment manually until v0.7 shape-cutting lands.
-- **Hat Renderer** (`hat-renderer`) — Takes structured signal, assembles the Orchestrator's hat artifact in structured markdown (Active Seeds, Recent Decisions, Pav's Latest Direction, Blocked Items). One renderer per consumer in v1. Outputs to world-bench/hats/orchestrator/hat.md. Contracts (inputContract / outputContract) at this lens's boundaries are mandatory and concrete. Pav mediates seam alignment manually until v0.7 shape-cutting lands.
+- **Harvester** (`harvester`) — Pulls raw messages from #room-orchestrator via Slack API (curl + Orchestrator token). Handles pagination, thread expansion, user resolution, timestamps. Outputs harvest.json — flat chronological array with thread pointers. Designed so adding channels later is a config change, not a rewrite.
+- **Signal Extractor** (`signal-extractor`) — Reads harvest.json, strips tool noise, tags entries by type (decision, action, direction, observation, status). Resolves entities to canonical IDs. Outputs signal.json (audit trail) + compiled/ markdown directory following Karpathy's LLM Wiki architecture: index.md entry point, entity pages, seed pages, decision pages, direction arcs, blocked items. The compiled/ directory is the sole interface to the Hat Renderer.
+- **Hat Renderer** (`hat-renderer`) — Reads ONLY the Signal Extractor's compiled/ markdown directory (Claw's acceptance gate — no harvest.json, no raw Slack). Produces the Orchestrator's hat at world-bench/hats/orchestrator/hat.md. Compiles for action, not elegance — prefers selection over paraphrase, explicit source pointers over smooth prose, 'insufficient evidence' over filler. One renderer per consumer in v1.
 
 ## Machine
 
@@ -45,22 +47,22 @@ When Pav asks 'what's going on right now?' the Orchestrator returns a useful, st
 {
   "slug": "memory-hats",
   "intent": "Build a filtered, role-specific working view (a 'hat') over shared memory. Each hat serves one consumer and one job. First hat: the Orchestrator's own — built from #room-orchestrator so it can track active seeds, recent decisions, project state, and Pav's latest direction without raw thread dumps.",
-  "output_shape": "When Pav asks 'what's going on right now?' the Orchestrator returns a useful, structured answer drawn from the hat — not a raw channel dump. The hat is a persistent artifact that updates with new data and filters by role. Concretely: a markdown file at world-bench/hats/orchestrator/hat.md with sections Active Seeds / Recent Decisions / Pav's Latest Direction / Blocked Items, soft cap ~500 words, readable by humans and agents, no JSON.",
+  "output_shape": "When Pav asks 'what's going on right now?' the Orchestrator returns a useful, structured answer drawn from the hat — not a raw channel dump. The hat is a persistent artifact that updates with new data and filters by role. Concretely: a markdown file at world-bench/hats/orchestrator/hat.md with sections Active Seeds / Recent Decisions / Pav's Latest Direction / Blocked Items / Changelog / Sources, soft cap ~500 words, readable by humans and agents, no JSON. Each section carries staleness and confidence indicators. Source pointers trace back to compiled/ pages for auditability.",
   "lens_sketch": [
     {
       "slug": "harvester",
       "name": "Harvester",
-      "purpose": "Pulls raw messages from #room-orchestrator via Slack MCP. Handles pagination, thread expansion, timestamps. Outputs raw chronological dump with metadata. Designed so adding channels later is a config change, not a rewrite. Contracts (inputContract / outputContract) at this lens's boundaries are mandatory and concrete. Pav mediates seam alignment manually until v0.7 shape-cutting lands."
+      "purpose": "Pulls raw messages from #room-orchestrator via Slack API (curl + Orchestrator token). Handles pagination, thread expansion, user resolution, timestamps. Outputs harvest.json — flat chronological array with thread pointers. Designed so adding channels later is a config change, not a rewrite."
     },
     {
       "slug": "signal-extractor",
       "name": "Signal Extractor",
-      "purpose": "Reads raw message dump, strips tool noise, tags entries by type (decision, action, task, direction, observation). Extracts entities and relationships. Outputs structured signal. If the downstream hat exceeds ~500 words, this lens is letting too much through. Contracts (inputContract / outputContract) at this lens's boundaries are mandatory and concrete. Pav mediates seam alignment manually until v0.7 shape-cutting lands."
+      "purpose": "Reads harvest.json, strips tool noise, tags entries by type (decision, action, direction, observation, status). Resolves entities to canonical IDs. Outputs signal.json (audit trail) + compiled/ markdown directory following Karpathy's LLM Wiki architecture: index.md entry point, entity pages, seed pages, decision pages, direction arcs, blocked items. The compiled/ directory is the sole interface to the Hat Renderer."
     },
     {
       "slug": "hat-renderer",
       "name": "Hat Renderer",
-      "purpose": "Takes structured signal, assembles the Orchestrator's hat artifact in structured markdown (Active Seeds, Recent Decisions, Pav's Latest Direction, Blocked Items). One renderer per consumer in v1. Outputs to world-bench/hats/orchestrator/hat.md. Contracts (inputContract / outputContract) at this lens's boundaries are mandatory and concrete. Pav mediates seam alignment manually until v0.7 shape-cutting lands."
+      "purpose": "Reads ONLY the Signal Extractor's compiled/ markdown directory (Claw's acceptance gate — no harvest.json, no raw Slack). Produces the Orchestrator's hat at world-bench/hats/orchestrator/hat.md. Compiles for action, not elegance — prefers selection over paraphrase, explicit source pointers over smooth prose, 'insufficient evidence' over filler. One renderer per consumer in v1."
     }
   ],
   "status": "rendering",
@@ -76,9 +78,11 @@ When Pav asks 'what's going on right now?' the Orchestrator returns a useful, st
     ],
     "process": [
       "shape-cutting is manual until v0.7 — Pav mediates contract alignment between lenses",
-      "every lens declares concrete inputContract and outputContract. Real field names, types, cardinality. Not 'raw messages with metadata.'",
-      "the Harvester's outputContract becomes the template for every downstream boundary — write it like a spec",
-      "start with the Harvester to get ground-truth data before tuning Signal Extractor's tagging rules"
+      "every lens declares concrete inputContract and outputContract. Real field names, types, cardinality.",
+      "Karpathy LLM Wiki pattern is the architectural foundation: raw sources → compiled wiki → presentation",
+      "Hat Renderer reads compiled/ only — no harvest.json, no raw Slack. If the hat can't be produced from compiled/ alone, the failure belongs upstream (Claw's acceptance gate)",
+      "Hat compiles for action, not elegance: selection over paraphrase, source pointers over smooth prose, 'insufficient evidence' over filler (Claw)",
+      "Each hat section carries staleness (per-section newest signal timestamp) and confidence indicators (Claw)"
     ]
   },
   "artifact_spec": {
@@ -88,10 +92,12 @@ When Pav asks 'what's going on right now?' the Orchestrator returns a useful, st
       "Active Seeds",
       "Recent Decisions",
       "Pav's Latest Direction",
-      "Blocked Items"
+      "Blocked Items",
+      "Changelog",
+      "Sources"
     ],
     "word_cap": 500,
-    "notes": "On-demand rebuild, no persistence layer, no watermark. Full pipeline runs every time the hat is requested — that's the feature, not a bug."
+    "notes": "On-demand rebuild, full pipeline runs every time. Each section includes staleness indicator (newest signal timestamp) and confidence level. Source pointers trace to compiled/ pages for auditability. No raw Slack — compiled/ is the only upstream input."
   }
 }
 ```

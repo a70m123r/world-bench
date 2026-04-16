@@ -6,7 +6,7 @@
 
 **Project:** Memory Hats
 **Seed:** `SEED.md` — build a filtered, role-specific working view over shared memory
-**Phase:** Pipeline build — first lens rendered, settling toward steady state
+**Phase:** Pipeline proven — first clean end-to-end rehearsal complete. Output shape met.
 
 ---
 
@@ -14,9 +14,14 @@
 
 ```
 Harvester → Signal Extractor → Hat Renderer
-   ✓            ○                  ○
-settling      not started       not started
+   ✓            ✓                  ✓
+  steady       steady           settling
+  836 msgs     17 compiled      hat_version 3
+  Bash x1      27s clean        520 words
 ```
+
+**Architecture:** Karpathy LLM Wiki pattern — raw sources → compiled wiki → presentation.
+**Compression:** 836 messages → 781 signals → 17 compiled pages → 520-word hat (~160:1)
 
 ---
 
@@ -24,9 +29,37 @@ settling      not started       not started
 
 | Lens | Maturity | Renders | Last Run | Duration | Output | Next Action |
 |------|----------|---------|----------|----------|--------|-------------|
-| **Harvester** | `settling` | 7 clean | `c690749b` (2026-04-11 02:05) | 57s | 691 msgs, 921KB | 1 more clean render → `steady` |
-| **Signal Extractor** | — | 0 | — | — | — | Propose lens, meet, render |
-| **Hat Renderer** | — | 0 | — | — | — | Blocked on Signal Extractor |
+| **Harvester** | `steady` | 10+ | 2026-04-14 | ~4.5min | 836 msgs → harvest.json | Done |
+| **Signal Extractor** | `steady` | 6+ | 2026-04-14 | ~27s | signal.json + compiled/ (17 pages) | Fix seed page quality regression |
+| **Hat Renderer** | `settling` | 3 | 2026-04-14 | ~4.5min | hat.md v3 (520 words) | 1 more clean render → steady |
+
+---
+
+## Rehearsals
+
+| # | Date | Status | Notes |
+|---|------|--------|-------|
+| 1 | 2026-04-14 01:30Z | partial | Harvester ✓, SE ✗ (30-turn limit), Hat Renderer ✓ (used stale compiled/) |
+| 2 | 2026-04-14 03:16Z | **complete** | All three ✓. First clean end-to-end. hat_version 3 produced. |
+| 3 | 2026-04-14 13:24Z | **complete** | Hat refresh. hat_version 4. Captured hat-swapping + eval discussions. |
+| 4 | 2026-04-15 03:46Z | **complete** | SE quality fix + hat v5. first_sentences() applied but decision clusters mis-anchored. |
+
+---
+
+## Known Quality Issue — Decision Cluster Mis-anchoring
+
+**Root cause:** extract_v4.py topic_map regex patterns are too broad.
+- `v0.6` matches "settling|steady|discover" → 109 signals in one cluster (catch-all)
+- `v0.5` matches "audit" → pulls run audits, council audits
+- `karpathy` matches "compiled.*dir" → pulls hat-swapping discussion
+
+**Effect:** Wrong threads → wrong anchors → factually incorrect decision summaries. Hat Renderer compensates using memory of prior clean versions but flags confidence as `medium`.
+
+**Fix options (posted to council for input):**
+- A: Tighten regexes (quick, fragile)
+- B: Thread-first clustering (robust, structural)
+- C: Decision-statement extraction (find "my position:" / "approved" / "consensus:")
+- Orchestrator recommends B+C (v5 rewrite of clustering logic)
 
 ---
 
@@ -34,101 +67,24 @@ settling      not started       not started
 
 | Date | Decision | By | Evidence |
 |------|----------|-----|---------|
-| 2026-04-09 02:18 | Flat array with `threadTs` pointers, not nested | Harvester + Orchestrator | Meet session, Pav approved |
-| 2026-04-09 02:29 | TS implementation, not Python | Orchestrator relay to Harvester | Harvester accepted |
-| 2026-04-09 02:29 | Include bots (flagged), reactions, subtypes | Orchestrator relay | Harvester accepted |
-| 2026-04-09 02:29 | Full rebuild every run, no incremental state | Orchestrator relay | Aligned with seed constraint |
-| 2026-04-11 00:32 | Removed MCP tools from Harvester config | Orchestrator (autonomous settling) | Tools 404'd on 3 renders |
-| 2026-04-11 00:32 | Disabled research phase | Orchestrator (autonomous settling) | Research completed, `harvest.py` exists |
-| 2026-04-11 01:00 | Maturity lifecycle adopted (4 phases) | Council unanimous | `SPEC-lens-maturity-lifecycle.md` |
-| 2026-04-11 01:38 | Lens-as-gate settling, versioned prompts, maturityLog | Pav + council | Spec v2, council unanimous |
-| 2026-04-11 18:06 | Two-layer architecture (Slack=rendering, substrate=truth) | Council unanimous | `AUDIT-v0.6.8-state-and-vision.md` |
-| 2026-04-11 18:06 | Orchestrator mediates all lens↔lens interaction | Council unanimous | No peer-to-peer until 4+ settled lenses |
-| 2026-04-11 18:06 | `EscalateToChannel` tool for lens self-escalation | Council unanimous | Not hook-based |
+| 2026-04-09 | Flat array with threadTs pointers | Harvester + Orc | Meet session |
+| 2026-04-11 | Maturity lifecycle adopted (4 phases) | Council unanimous | Spec v2 |
+| 2026-04-13 | Karpathy LLM Wiki pattern adopted | Council + Pav | SE → compiled/ directory |
+| 2026-04-14 | Claw's acceptance gate: Hat reads compiled/ only | Claw + council | Unanimous |
+| 2026-04-14 | Hat sections: 6 with staleness + confidence | Council consensus | Claw: fresh ≠ confident |
+| 2026-04-14 | SE refactored to data-driven (extract_v4.py) | SE self-diagnosis | 30-turn → 27s |
+| 2026-04-14 | Seed amended — Karpathy pattern + evolved design | Orchestrator | amend_seed |
+| 2026-04-14 | Hat wired into Orchestrator context loading | Spinner | Hardcoded path, read-only |
+| 2026-04-14 | Hat-swapping: filesystem convention, no MCP until N≥5 | Council consensus | Soren's room-zero read |
 
 ---
 
-## Harvester — Detailed State
+## Open Questions (posted to council)
 
-**Config (settled, prompt v2):**
-- Tools: `Read, Write, Edit, Bash, Glob, Grep`
-- Research: disabled
-- Implementation: `harvest.py` — curl-based Slack API harvester
-- Channel: `#wb-lens-harvester` (`C0ARUMPDYSY`)
-
-**Render History:**
-| # | Run ID | Date | Duration | Status | Notes |
-|---|--------|------|----------|--------|-------|
-| 1 | `c1919670` | Apr 9 02:55 | 18s | failed | Stale session resume (v0.6.5.7 fixed) |
-| 2 | `09ac10dd` | Apr 9 03:18 | 90s | failed | maxTurns=10 + plugin Slack OAuth loop (v0.6.5.8 fixed) |
-| 3 | `aea6b064` | Apr 10 07:00 | 4m45s | completed | First success. Wrote `harvest.py`. 626 msgs. |
-| 4 | `d75bedb6` | Apr 10 23:46 | 1m29s | completed | Reused script, wasted turns on MCP search |
-| 5 | `5a9f13db` | Apr 11 00:31 | 1m44s | completed | Orchestrator settled config (removed MCP, disabled research) |
-| 6 | `e60b23b9` | Apr 11 00:33 | 1m05s | completed | Clean — zero wasted turns on settled config |
-| 7 | `c690749b` | Apr 11 02:05 | 57s | completed | Clean — fastest render, 691 msgs |
-
-**Output Contract:**
-```json
-{
-  "messages": [{ "ts", "thread_ts", "user_id", "username", "text", "is_thread_parent", "reply_count", "reactions", "bot_id", "subtype" }],
-  "metadata": { "channel_id", "channel_name", "message_count", "thread_count", "harvested_at", "oldest_message_ts", "latest_message_ts", "errors" }
-}
-```
+1. SE decision cluster fix shape — A (tighten regex), B (thread-first), C (decision-statement extraction), or B+C?
+2. Eval/test lens design — council favors rehearse verb (Option B) over new lens
+3. Is memory-hats ready to close as a seed?
 
 ---
 
-## Signal Extractor — Not Started
-
-**From seed sketch:**
-> Reads raw message dump, strips tool noise, tags entries by type (decision, action, task, direction, observation). Extracts entities and relationships. Outputs structured signal.
-
-**Input:** Harvester's `harvest.json`
-**Output:** Tagged + structured signal for the Hat Renderer
-**Depends on:** Harvester at `settling` or `steady`
-
----
-
-## Hat Renderer — Not Started
-
-**From seed sketch:**
-> Takes structured signal, assembles the Orchestrator's hat artifact in structured markdown (Active Seeds, Recent Decisions, Pav's Latest Direction, Blocked Items).
-
-**Input:** Signal Extractor's output
-**Output:** `world-bench/hats/orchestrator/hat.md`
-**Depends on:** Signal Extractor rendered + settling
-
----
-
-## Blockers
-
-_None currently. Harvester is stable. Signal Extractor can be proposed._
-
----
-
-## Infrastructure Changes (v0.6.5 → v0.6.9)
-
-| Version | What | Impact on this project |
-|---------|------|----------------------|
-| v0.6.5.1–.8 | Dialogue layer debug series (8 patches) | Meet + render cycle now works end-to-end |
-| v0.6.6 | Lens channel streaming + post-run audit | Lens channel gets start post + escalations + audit |
-| v0.6.6.1 | Channel ID preservation on re-attach | `slack_channel_id` survives re-renders |
-| v0.6.7 | Maturity lifecycle | 4-phase tracking, maturityLog, prompt versioning |
-| v0.6.8/.8.1 | Lens channel as meeting room | Pav can chat with lenses in their channel |
-| v0.6.9 | Gate 0+1+2: sessionId capture, `amend_lens`, context injection | Lenses have identity continuity + state protection + situational awareness |
-
----
-
-## What's Next
-
-1. **Render Harvester once more** → verify sessionId capture + context injection + `amend_lens`
-2. **Advance Harvester to `steady`** → if render is clean (2+ consecutive clean renders met)
-3. **Propose Signal Extractor** → Orchestrator drafts lens config based on Harvester's output contract
-4. **Meet Signal Extractor** → in `#wb-lens-signal-extractor`, Pav shapes the brief
-5. **Render Signal Extractor** → first cut, using `harvest.json` as input
-6. **Pipeline rehearsal** → `rehearse` with Harvester → Signal Extractor, watch the seam
-7. **Propose Hat Renderer** → once Signal Extractor is settling
-8. **Full pipeline render** → `rehearse` all three, produce `hat.md`
-
----
-
-_Last updated: 2026-04-11 by Spinner. Orchestrator should update after each render/meet/settle._
+_Last updated: 2026-04-15 04:00Z by Orchestrator. Hat v5 produced, SE quality audit posted to council._
