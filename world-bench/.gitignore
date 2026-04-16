@@ -5,6 +5,15 @@ orchestrator/memory/
 orchestrator/runs/
 *.log
 
+# Transient Slack-posting tempfiles that Orc/lenses sometimes drop at cwd
+# when posting via curl+tempfile pattern. Phase B streaming should make these
+# obsolete but older agent behavior still produces them. See KNOWN-ISSUES #6.
+_harv*.txt
+_council*.txt
+_proj*.txt
+_msg_*.txt
+_post_*.txt
+
 # Projects: track structure + state files. Git history = project changelog.
 # Tracked: SEED.md, SHOOTS.md, project.json, lens.json, prompt-history.json, harvest.py
 # Ignored: rebuildable output, transient run artifacts, scratchpads
