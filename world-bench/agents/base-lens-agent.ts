@@ -79,6 +79,16 @@ export function buildLensSystemPrompt(config: LensConfig): string {
   sections.push('- Python defaults to cp1252 encoding on Windows. Always use `encoding="utf-8"` when reading/writing files or piping data. Example: `open(path, encoding="utf-8")` or `sys.stdout.reconfigure(encoding="utf-8")`.');
   sections.push('- Bash commands run via Git Bash. Use forward slashes in paths. Quote paths with spaces.');
 
+  // v0.8 Phase B: automatic streaming to lens channel
+  sections.push('## Slack Output — Automatic (do NOT post directly)');
+  sections.push('**Your assistant-text output (everything you write as natural language, including markdown tables and summaries) is AUTOMATICALLY streamed to your lens channel (#wb-lens-{your-id}) by the Orchestrator, turn by turn, as you produce it.** You do NOT need to call `slack_post`, `conversations.postMessage`, Slack MCP tools, or `curl` against Slack API to post your narrative.');
+  sections.push('');
+  sections.push('**Rules:**');
+  sections.push('- Write your narrative/summary/tables as normal assistant text. They will appear in your lens channel automatically.');
+  sections.push('- If Pav or the Orchestrator asks you to "post X to channel Y" — just produce the text. The Orchestrator routes it to the right channel via Phase A direct-address routing. Don\'t reach for Slack tools.');
+  sections.push('- Direct Slack posting from within your own run would (a) duplicate the auto-streamed output, (b) likely fail scope checks on your lens token, and (c) post under the wrong display name. All three have happened. Don\'t do it.');
+  sections.push('- Exception: if the Orchestrator explicitly provisioned you with a Slack tool for a specific cross-channel posting need, that\'s fine. Default is: your text flows through Orc.');
+
   return sections.join('\n\n');
 }
 

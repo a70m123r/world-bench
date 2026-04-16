@@ -319,6 +319,34 @@ export class Orchestrator {
       }
     } catch { }
 
+    // Hat — Orchestrator's own briefing from the memory-hats pipeline
+    // Filesystem convention: world-bench/hats/{consumer}/hat.md (council decision 2026-04-14)
+    // Treat as "last known good" reference, not authoritative state. Flag staleness.
+    try {
+      const hatPath = path.join(WORLD_BENCH_ROOT, 'hats', 'orchestrator', 'hat.md');
+      if (fs.existsSync(hatPath)) {
+        const content = fs.readFileSync(hatPath, 'utf-8').trim();
+        if (content) {
+          const stat = fs.statSync(hatPath);
+          const ageMs = Date.now() - stat.mtimeMs;
+          const ageMin = Math.floor(ageMs / 60000);
+          const ageHr = Math.floor(ageMin / 60);
+          const ageStr = ageHr > 0
+            ? `${ageHr}h ${ageMin % 60}m ago`
+            : `${ageMin}m ago`;
+          const capped = content.length > 4000
+            ? content.slice(0, 4000) + '\n...(truncated, full hat at hats/orchestrator/hat.md)'
+            : content;
+          sections.push(
+            `## Your Hat (compiled briefing — last known good, not authoritative)\n` +
+            `_Rendered ${ageStr}. This is a compressed summary from the memory-hats pipeline. ` +
+            `Treat as reference; if your own observations contradict it, trust the observations and flag the drift._\n\n` +
+            capped
+          );
+        }
+      }
+    } catch { }
+
     if (sections.length === 0) return '';
     return '\n\n---\n# Context (loaded on wake)\n' + sections.join('\n\n');
   }
@@ -622,11 +650,26 @@ export class Orchestrator {
         `:satellite_antenna: **${lens.name}** run started — run \`${runId.slice(0, 8)}\``,
       );
 
-      await this.terminal.postAsLens(
-        lens,
-        projectSlug,
-        `Starting work on: ${taskPrompt.slice(0, 100)}...`,
+      // v0.8: project channel gets a first-line preview (bird's-eye — don't
+      // flood with the full task body); lens channel gets the FULL task prompt
+      // (the lens's own room, carries complete context for the render).
+      const firstLineMatch = taskPrompt.match(/^[^\n]+/);
+      const firstLine = firstLineMatch ? firstLineMatch[0].trim() : '';
+      const preview = firstLine.length > 0 && firstLine.length <= 400
+        ? firstLine
+        : taskPrompt.slice(0, 300).trim() + '...';
+
+      // Project channel: concise preview
+      await this.terminal.postAsLens(lens, projectSlug, `Starting work on: ${preview}`);
+
+      // Lens channel: full task prompt (chunked for Slack's 4000-char limit)
+      await this.terminal.postToLensChannel(
+        projectSlug, lens.id, lens,
+        `:clipboard: *Task brief:*`,
       );
+      for (const chunk of splitForSlack(taskPrompt)) {
+        await this.terminal.postToLensChannel(projectSlug, lens.id, lens, chunk);
+      }
 
       // v0.6.9: inject situational awareness into the task prompt so the lens
       // knows its maturity, recent history, pipeline position, and SHOOTS.md
@@ -656,13 +699,21 @@ export class Orchestrator {
       const rawOutput = result.productionResult?.output || '';
       const humanSummary = summarizeOutput(rawOutput, lens.name);
 
-      // Lens channel gets the full output (split if needed for Slack's 4000 char limit)
+      // v0.8 Phase B: lens narrative is now streamed live to the lens channel
+      // during the run (see agent-adapter.ts streamTextToLens). Posting the
+      // full output here would duplicate what's already there. Skip it.
+      // Exception: if streaming produced nothing (empty output), we still want
+      // a "finished" marker so the channel has a clear end-of-run signal.
       await this.terminal.postToLensChannel(
         projectSlug, lens.id, lens,
         `**${lens.name}** finished: \`${status}\``,
       );
-      for (const chunk of splitForSlack(rawOutput)) {
-        await this.terminal.postToLensChannel(projectSlug, lens.id, lens, chunk);
+      if (!rawOutput || rawOutput.trim().length === 0) {
+        // No text was streamed — post a placeholder so silence isn't ambiguous.
+        await this.terminal.postToLensChannel(
+          projectSlug, lens.id, lens,
+          '_(no text output; see tool heartbeats and run audit for what happened)_',
+        );
       }
 
       // v0.6.6: post structured run audit to lens channel
@@ -1325,6 +1376,11 @@ export class Orchestrator {
     speaker: string;
     message: string;
     triggerTs: string;
+    // v0.8 Phase A: optional override for where the lens response lands.
+    // Defaults to channelId (Route 3 behavior — post back to the lens channel).
+    // When called from Route 4 (project channel routing), this is the project
+    // channel so the response appears in the room where the human addressed the lens.
+    postToChannelId?: string;
   }): Promise<void> {
     await this.terminal.addThinkingReaction(args.channelId, args.triggerTs);
 
@@ -1432,11 +1488,14 @@ export class Orchestrator {
         return;
       }
 
-      // Post the lens's response in the lens channel under its persona
+      // Post the lens's response under its persona.
+      // Phase A: if postToChannelId is set (Route 4 project channel), post there;
+      // otherwise default to the trigger channel (Route 3 lens channel behavior).
+      const responseChannel = args.postToChannelId || args.channelId;
       const rawOutput = result.output || '_(no response)_';
       const chunks = splitForSlack(rawOutput);
       for (const chunk of chunks) {
-        await this.terminal.postToChannelAs(args.channelId, persona, chunk);
+        await this.terminal.postToChannelAs(responseChannel, persona, chunk);
       }
     } catch (e: any) {
       await this.terminal.removeThinkingReaction(args.channelId, args.triggerTs);
@@ -1848,7 +1907,9 @@ export class Orchestrator {
           // Post a pointer in the original channel so Pav knows where to go
           if (meetChannel !== replyTo) {
             await this.terminal.postToChannel(replyTo,
-              `:wave: Meeting lens \`${lens.id}\` in <#${meetChannel}>. Head there to talk to it.`,
+              `:wave: Meeting lens \`${lens.id}\` in <#${meetChannel}> for the formal brief conversation. ` +
+              `_You can also address \`${lens.slackPersona?.username || lens.id}\` directly in this channel with ` +
+              `\`${lens.slackPersona?.username || lens.id}: <message>\` for casual follow-up — replies land here._`,
             );
           }
 
@@ -2380,6 +2441,42 @@ Each project has a \`SHOOTS.md\` alongside its \`SEED.md\`. The seed is the inte
 \`SHOOTS.md\` is YOUR document — you write it directly (it's in your allowed write targets, not behind an action verb). Keep it accurate. Pav and the council read it for project-level situational awareness. Lenses read it (via context injection) to know where they sit in the pipeline.
 
 Format: pipeline diagram at top, lens status table, decisions log, blockers, what's next. See the existing \`projects/memory-hats/SHOOTS.md\` for the template.
+
+## Slack Discipline (MANDATORY — non-negotiable)
+
+**When you respond to a message in Slack, your post MUST be a thread reply, not a top-level post.** Pass \`thread_ts\` on every response equal to the ts of the message you're replying to (or the thread root if you're joining an existing thread).
+
+A top-level post introduces a new topic. A thread reply continues an existing one. These are not interchangeable. If a brief is posted with ts X and you reply to it, your \`thread_ts\` is X. If you follow up on your own reply, your \`thread_ts\` is still X. If you change your mind, post inside the same thread — do NOT post a new top-level "changed my read." Revision stays threaded so readers can follow the conversation linearly.
+
+**Top-level posts are correct only for:** (1) new topics no one has raised, (2) deliberate escalations from threads (prefix with "Escalating from thread X: …"), (3) scheduled one-shot status posts. Everything else threads.
+
+If you're unsure, default to threading. A wrong thread is recoverable; top-level chaos is not. The canonical rules live in \`council/SLACK-ETIQUETTE.md\` Rule 1 — read it if in doubt. This rule applies to EVERY channel (#room-orchestrator, #wb-proj-*, #wb-lens-*, #kitchen, #room-zero, DMs).
+
+## Read Channel Context Before Responding (2026-04-16 blind-spot fix)
+
+**When you are tagged in a project or lens channel, read the recent channel history BEFORE responding.** Specifically:
+
+- If Pav tags you in \`#wb-proj-*\` right after addressing a lens there (e.g. "signal extractor: X" followed by "<@Orchestrator> what's your thoughts?"), **there is almost certainly a lens response sitting above the tag that you need to have read before answering.** Phase A routing means lens responses land in the same channel. Your tag is asking you to respond to the unfolding conversation, not start a fresh one from your own context.
+- Don't go straight to your memory, your scratchpad, or the latest render audit. Scroll the channel. Read at least the last 5-10 messages before the one that tagged you.
+- This rule exists because on 2026-04-16 this exact failure happened: Pav addressed the SE, the SE posted a full self-assessment of the new harvest.json, Pav then tagged you, and you reviewed the Harvester render instead of responding to the SE's already-present proposal. You missed the message sitting one turn above the tag.
+
+Rule of thumb: *what was happening in this channel before I was pulled in?* Answer that first. Then respond.
+
+## Project Channel Conversations (v0.8 Phase A — READ CAREFULLY)
+
+Project channels (\`#wb-proj-*\`) are now full conversational rooms. Pav can address lenses directly by prefixing a message with the lens name — \`Harvester: <message>\` routes to Harvester, \`Signal Extractor: <message>\` routes to SE, \`Hat Renderer: <message>\` routes to HR (case-insensitive, also accepts \`-\` or \`,\` as separator). The lens responds in the project channel under its own persona. No \`meet_lens\` required for casual conversation.
+
+**When Pav is already in a project-channel conversation with a lens and asks you to share context / a brief / a file with that lens: do NOT fire \`meet_lens\`.** \`meet_lens\` moves the conversation to the lens channel, which is not what Pav wants when the dialogue is already live in the project room.
+
+Instead: **read the file or prepare the context yourself, then post it as a direct addressed message in the project channel**, like:
+
+> \`Harvester: the paw-claw handoff brief is at council/BRIEF-harvester-paw-claw-handoff.md — key points: [summary]. Full contents inline below: [paste relevant sections]\`
+
+Phase A routing picks up the \`Harvester:\` prefix and relays the full message to Harvester. Harvester reads the context and replies in the project channel. Conversation stays where Pav started it.
+
+**Reserve \`meet_lens\` for formal propose/amend workflows** — when a lens is being briefed before committing to a render, and the commitment weight justifies relocating to the lens channel. Not for "hey, look at this file" or "what do you think about X." Those are project-channel conversations, not formal meets.
+
+Rule of thumb: if Pav started the conversation in a project channel and wants it to continue there, your posts stay there. Direct-address the lens. Don't switch paths.
 
 ## The Dialogue Layer (v0.6.5 — load-bearing for multi-party conversation)
 

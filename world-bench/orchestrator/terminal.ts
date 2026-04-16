@@ -31,6 +31,14 @@ export class Terminal {
     this.client = this.app.client;
   }
 
+  // v0.8: loop-guard state for bot-authored lens routing. When Orc posts a
+  // prefixed message like "Signal Extractor: ..." to trigger a lens response,
+  // the routing wakes the lens. The lens's reply also comes through Orc's bot
+  // account; if the reply coincidentally started with a lens prefix, it could
+  // re-trigger routing. We suppress bot-originated re-dispatches to the same
+  // lens within a 30s window to short-circuit any accidental loops.
+  private lastBotDispatchTs: Map<string, number> = new Map();
+
   // v0.6.9 Gate 2: expose the Slack WebClient for lens context injection
   // (buildLensContext needs it to fetch lens channel history)
   getSlackClient(): any {
@@ -108,11 +116,17 @@ export class Terminal {
     this.app.message(async ({ message }) => {
       const channelId = (message as any).channel;
 
-      // Ignore bot messages (including our own)
-      if ((message as any).bot_id || (message as any).subtype) return;
+      // v0.8: drop subtypes (joins, pins, system events) unconditionally.
+      // Bot messages are NO LONGER dropped here — we allow them through so that
+      // Orc's direct-address posts ("Signal Extractor: ...") can reach the
+      // Phase A prefix parser and route to the target lens. Downstream routing
+      // logic handles self-echo and loop protection. Bot messages without a
+      // routable prefix are silently ignored in the route-4 branch below.
+      if ((message as any).subtype) return;
 
       const text = (message as any).text || '';
       const userId = (message as any).user || '';
+      const isBotMessage = !!(message as any).bot_id;
       if (!text.trim()) return;
 
       // v0.6.5.3: log every message that reaches the handler so we have evidence
@@ -214,6 +228,14 @@ export class Terminal {
       // in a lens channel triggers continue_meet with that lens's session.
       const lensBinding = this.getLensForChannel(channelId);
       if (lensBinding) {
+        // v0.8: suppress bot-authored messages in lens channels. Orc posts
+        // status banners, audits, tool-use heartbeats, and streamed narrative
+        // in lens channels via the lens persona — none of those should wake
+        // the lens back up. Phase A routing in project channels (Route 4)
+        // handles explicit bot-to-lens via the prefix pattern; lens channels
+        // stay human-driven for now.
+        if (isBotMessage) return;
+
         const isOrcTagged = this.botUserId && text.includes(`<@${this.botUserId}>`);
         if (isOrcTagged) {
           console.log(`[Terminal] Tagged in lens channel ${channelId}, deferring to app_mention`);
@@ -238,9 +260,64 @@ export class Terminal {
         return;
       }
 
-      // Route 4: Messages in #wb-proj-* channels → feedback capture
+      // Route 4: Messages in #wb-proj-* channels.
+      // v0.8 Phase A: if the message starts with a lens name prefix (e.g.
+      // "Harvester: look at X"), route to that lens and post the response back
+      // to THIS channel (project room) as the lens persona. Otherwise fall back
+      // to feedback capture — @mentions of Orc are handled by app_mention (Route 1).
       const projectSlug = this.getProjectSlugForChannel(channelId);
       if (projectSlug) {
+        // Skip tagged-Orc messages — app_mention (Route 1) owns those.
+        const isOrcTagged = this.botUserId && text.includes(`<@${this.botUserId}>`);
+        if (isOrcTagged) {
+          console.log(`[Terminal] Tagged Orc in proj-${projectSlug}, deferring to app_mention`);
+          return;
+        }
+
+        const lenses = this.getProjectLenses(projectSlug);
+        const addressee = this.parseLensPrefix(text, lenses);
+
+        if (addressee) {
+          // v0.8: loop guard for bot-authored routing. If Orc just dispatched
+          // to this lens recently, suppress the new dispatch. Prevents accidental
+          // ping-pong if a lens response coincidentally starts with another
+          // lens's prefix.
+          if (isBotMessage) {
+            const loopKey = `${projectSlug}:${addressee.lensId}`;
+            const lastTs = this.lastBotDispatchTs.get(loopKey) || 0;
+            if (Date.now() - lastTs < 30_000) {
+              console.log(`[Terminal] Bot-to-lens re-dispatch suppressed (30s window): ${loopKey}`);
+              return;
+            }
+            this.lastBotDispatchTs.set(loopKey, Date.now());
+          }
+
+          const lens = lenses.find(l => l.id === addressee.lensId)!;
+          console.log(`[Terminal] Project-channel lens relay: ${isBotMessage ? 'bot' : userId} → ${addressee.lensId} in proj-${projectSlug}`);
+          try {
+            await this.orchestrator.handleLensChannelMessage({
+              channelId,
+              projectSlug,
+              lensId: addressee.lensId,
+              sessionId: lens.sessionId,
+              speaker: userId === PAV_USER_ID ? 'pav' : 'orchestrator',
+              message: addressee.strippedMessage,
+              triggerTs: (message as any).ts,
+              postToChannelId: channelId, // response lands in the project channel
+            });
+          } catch (error: any) {
+            console.error('[Terminal] Project-channel lens relay failed:', error);
+            await this.postToChannel(channelId, `:warning: Relay to ${addressee.lensId} failed: ${error.message}`);
+          }
+          return;
+        }
+
+        // No addressee matched. For bot messages, drop silently (status posts,
+        // run audits, streaming narrative — all authored by our bot, not
+        // intended for feedback capture). For human messages, capture feedback.
+        if (isBotMessage) {
+          return;
+        }
         console.log(`[Terminal] Feedback in proj-${projectSlug} from ${userId}: ${text.slice(0, 80)}`);
         this.captureFeedback(projectSlug, userId, text);
       }
@@ -567,6 +644,93 @@ export class Terminal {
         }
       }
     } catch { }
+    return null;
+  }
+
+  /**
+   * v0.8 Phase A: Enumerate lenses attached to a project. Returns each lens's
+   * id, persona username, and current sessionId (if any). Used by the Route 4
+   * handler to know which lens names to look for as message prefixes.
+   */
+  private getProjectLenses(projectSlug: string): Array<{
+    id: string;
+    username: string;
+    sessionId: string;
+  }> {
+    const result: Array<{ id: string; username: string; sessionId: string }> = [];
+    try {
+      const lensesDir = path.join(WORLD_BENCH_ROOT, 'projects', projectSlug, 'lenses');
+      if (!fs.existsSync(lensesDir)) return result;
+
+      for (const lensId of fs.readdirSync(lensesDir)) {
+        const lensJsonPath = path.join(lensesDir, lensId, 'lens.json');
+        if (!fs.existsSync(lensJsonPath)) continue;
+        try {
+          const data = JSON.parse(fs.readFileSync(lensJsonPath, 'utf-8'));
+          const username: string = (data.slackPersona && data.slackPersona.username) || lensId;
+          result.push({
+            id: lensId,
+            username,
+            sessionId: data.sessionId || '',
+          });
+        } catch { /* skip malformed */ }
+      }
+    } catch { }
+    return result;
+  }
+
+  /**
+   * v0.8 Phase A: Parse a lens-addressee prefix from the start of a message.
+   * Convention: "<lens-username>:" or "<lens-id>:" at the start (optional leading
+   * whitespace, case-insensitive). Returns the matched lens id and the message
+   * with the prefix stripped. Null if no prefix matches.
+   *
+   * Examples with lenses = [{id:'harvester', username:'Harvester'}, {id:'signal-extractor', username:'Signal Extractor'}, {id:'hat-renderer', username:'Hat Renderer'}]:
+   *   "Harvester: look at X"      → { lensId: 'harvester', strippedMessage: 'look at X' }
+   *   "harvester: look at X"      → { lensId: 'harvester', strippedMessage: 'look at X' }
+   *   "signal extractor: do Y"    → { lensId: 'signal-extractor', strippedMessage: 'do Y' }
+   *   "Hat Renderer: hi"          → { lensId: 'hat-renderer', strippedMessage: 'hi' }
+   *   "hey Harvester look at X"   → null (prefix not at start, no colon)
+   *   "Harvester look at X"       → null (no colon)
+   */
+  private parseLensPrefix(
+    text: string,
+    lenses: Array<{ id: string; username: string }>,
+  ): { lensId: string; strippedMessage: string } | null {
+    const trimmed = text.replace(/^\s+/, '');
+    const lowered = trimmed.toLowerCase();
+
+    // Build candidates: each lens contributes both its id and its username as
+    // possible prefixes. Try longest first so "signal extractor" wins over
+    // a hypothetical shorter-name collision.
+    const candidates: Array<{ key: string; lensId: string }> = [];
+    for (const lens of lenses) {
+      candidates.push({ key: lens.username.toLowerCase(), lensId: lens.id });
+      if (lens.id.toLowerCase() !== lens.username.toLowerCase()) {
+        candidates.push({ key: lens.id.toLowerCase(), lensId: lens.id });
+      }
+      // Also accept username with hyphens swapped for spaces and vice versa
+      const flipped = lens.username.toLowerCase().replace(/[-\s]+/g, ' ');
+      if (!candidates.some(c => c.key === flipped)) {
+        candidates.push({ key: flipped, lensId: lens.id });
+      }
+    }
+    candidates.sort((a, b) => b.key.length - a.key.length);
+
+    for (const cand of candidates) {
+      // Match "<key>:" with optional whitespace around the colon.
+      // Allow the key itself to contain single spaces (e.g. "signal extractor").
+      if (lowered.startsWith(cand.key)) {
+        const rest = trimmed.slice(cand.key.length);
+        const colonMatch = rest.match(/^\s*[:\-,]\s*(.*)$/s);
+        if (colonMatch) {
+          const strippedMessage = colonMatch[1].trim();
+          if (strippedMessage.length > 0) {
+            return { lensId: cand.lensId, strippedMessage };
+          }
+        }
+      }
+    }
     return null;
   }
 

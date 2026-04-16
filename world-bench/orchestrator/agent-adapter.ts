@@ -91,6 +91,33 @@ export class ClaudeAgentAdapter implements AgentAdapter {
 
       this.activeQueries.set(agentId, { abort: abortController, query: q });
 
+      // v0.8 Phase B: stream the lens's assistant-text narrative live to its
+      // lens channel as each turn arrives (not batched to end-of-run). This is
+      // what Pav actually cares about — the "Clean run. All 9 channels..." prose,
+      // progress tables, diagnostic narrative. Tool-use heartbeats (wrenches) are
+      // the lightweight "I'm alive" ticker; this is the real signal.
+      const streamTerminal: any = context.terminal;
+      const streamLensId: string = context.lensId || '';
+      const streamLensConfig: LensConfig | undefined = context.lensConfig;
+      const streamProjectSlug: string = context.projectSlug || '';
+      const streamEnabled = !!(streamTerminal && streamLensId && streamLensConfig && streamProjectSlug);
+      const streamTextToLens = async (text: string): Promise<void> => {
+        if (!streamEnabled) return;
+        const trimmed = text.trim();
+        // Skip empty or trivial acknowledgement strings that would spam the channel.
+        if (trimmed.length < 20) return;
+        try {
+          const MAX = 3500;
+          if (trimmed.length <= MAX) {
+            await streamTerminal.postToLensChannel(streamProjectSlug, streamLensId, streamLensConfig!, trimmed);
+          } else {
+            for (let i = 0; i < trimmed.length; i += MAX) {
+              await streamTerminal.postToLensChannel(streamProjectSlug, streamLensId, streamLensConfig!, trimmed.slice(i, i + MAX));
+            }
+          }
+        } catch { /* non-critical — don't crash the run for a Slack post */ }
+      };
+
       for await (const message of q) {
         if (abortController.signal.aborted) break;
 
@@ -112,10 +139,12 @@ export class ClaudeAgentAdapter implements AgentAdapter {
         if (message.type === 'assistant' && message.message) {
           if (typeof message.message === 'string') {
             messages.push(message.message);
+            await streamTextToLens(message.message);
           } else if (message.message.content) {
             for (const block of message.message.content) {
               if (block.type === 'text') {
                 messages.push(block.text);
+                await streamTextToLens(block.text);
               }
             }
           }
@@ -242,11 +271,39 @@ export class ClaudeAgentAdapter implements AgentAdapter {
       } catch { /* non-critical — don't crash the lens for a Slack post */ }
     };
 
-    // Rate-limit state for verbose mode: batch consecutive same-tool calls
+    // Rate-limit state for streaming: batch consecutive same-tool calls
     // within a 2-second window to stay under Slack's ~1 msg/sec limit.
     let lastStreamedTool = '';
     let lastStreamedTime = 0;
     let batchedCount = 0;
+
+    // v0.8: tool filter for the always-on render streaming.
+    // Meaningful tools stream by default (Pav sees live progress).
+    // Noisy tools stay silent unless `verbose` is explicitly on.
+    // Errors and escalations always stream (handled elsewhere in the hook).
+    const MEANINGFUL_TOOLS = new Set([
+      'Bash',
+      'Edit',
+      'MultiEdit',
+      'Write',
+      'NotebookEdit',
+      'Task',
+      'WebFetch',
+      'WebSearch',
+    ]);
+    const isMeaningful = (toolName: string): boolean => {
+      if (MEANINGFUL_TOOLS.has(toolName)) return true;
+      // MCP tools with side-effects (posting, creating, deleting) are meaningful.
+      // Read-only MCP tools (search, list, read) stay suppressed to avoid spam.
+      if (toolName.startsWith('mcp__')) {
+        const lowered = toolName.toLowerCase();
+        if (lowered.includes('send') || lowered.includes('post') || lowered.includes('create')
+          || lowered.includes('update') || lowered.includes('delete') || lowered.includes('write')) {
+          return true;
+        }
+      }
+      return false;
+    };
 
     // v0.6.5.8: prefix matching for denied tools. Entries ending in '*' are
     // treated as prefix matches (e.g. 'mcp__plugin_slack_slack__*' blocks
@@ -348,8 +405,12 @@ export class ClaudeAgentAdapter implements AgentAdapter {
               appendEvent(projectSlug, runId, event);
             } catch { /* non-critical — don't crash the lens */ }
 
-            // v0.6.6: verbose mode streams every tool call to lens channel
-            if (verbose) {
+            // v0.8 Phase B: stream tool use to lens channel by default for
+            // meaningful tools (Bash/Edit/Write/Task/etc.). Verbose mode adds
+            // noisy tools (Read/Grep/Glob). Goal: Pav sees live render progress
+            // in #wb-lens-{slug} without the channel becoming tool-call soup.
+            const shouldStream = verbose || isMeaningful(toolName);
+            if (shouldStream) {
               const now = Date.now();
               const truncInput = typeof input.tool_input === 'string'
                 ? input.tool_input.slice(0, 80)
